@@ -43,9 +43,17 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
     private val outputPorts = ConcurrentHashMap<Int, MidiOutputPort>() // device -> receive port
     private val inputPorts = ConcurrentHashMap<Int, android.media.midi.MidiInputPort>() // -> send
 
+    // Called by the generated MobPluginBootstrap.registerAll BEFORE setActivity,
+    // to cache this jclass + the nativeDeliver* method ids.
+    @JvmStatic
+    fun register() {
+        nativeRegister()
+    }
+
+    // MobActivityAware: receive the host Activity at startup (instance dispatch,
+    // so not @JvmStatic).
     override fun setActivity(activity: Activity) {
         activityRef = WeakReference(activity)
-        nativeRegister()
     }
 
     private fun midiManager(): MidiManager? =

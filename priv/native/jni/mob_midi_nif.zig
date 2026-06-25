@@ -62,6 +62,13 @@ inline fn notLoaded(env: ?*erts.ErlNifEnv) erts.ERL_NIF_TERM {
     return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "nif_not_loaded") });
 }
 
+fn makeBinary(env: ?*erts.ErlNifEnv, data: []const u8) erts.ERL_NIF_TERM {
+    var bin: erts.ErlNifBinary = undefined;
+    _ = erts.enif_alloc_binary(data.len, &bin);
+    if (data.len > 0) @memcpy(bin.data[0..data.len], data);
+    return erts.enif_make_binary(env, &bin);
+}
+
 // ── NIFs ─────────────────────────────────────────────────────────────────
 
 fn callSelfVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID) erts.ERL_NIF_TERM {
@@ -148,9 +155,7 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiDevices(jenv: *jni
 
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    var bin_term: erts.ERL_NIF_TERM = undefined;
-    const buf = erts.enif_make_new_binary(env, span.len, &bin_term);
-    @memcpy(buf[0..span.len], span);
+    const bin_term = makeBinary(env, span);
     const msg = erts.makeTuple(env, .{ erts.atom(env, "midi"), erts.atom(env, "devices"), bin_term });
     _ = erts.enif_send(null, &pid, env, msg);
 }
@@ -158,19 +163,19 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiDevices(jenv: *jni
 pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiRaw(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, bytes: jni.JByteArray) callconv(.c) void {
     _ = cls;
     var pid = pidFromLong(pid_long);
-    const len: usize = @intCast(jenv.*.GetArrayLength.?(jenv, bytes));
-    const elems = jenv.*.GetByteArrayElements.?(jenv, bytes, null) orelse return;
-    defer jenv.*.ReleaseByteArrayElements.?(jenv, bytes, elems, 2); // JNI_ABORT
+    const len = jni.getArrayLength(jenv, bytes);
 
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    var bin_term: erts.ERL_NIF_TERM = undefined;
-    const buf = erts.enif_make_new_binary(env, len, &bin_term);
-    @memcpy(buf[0..len], @as([*]const u8, @ptrCast(elems))[0..len]);
-
-    var map = erts.enif_make_new_map(env);
-    _ = erts.enif_make_map_put(env, map, erts.atom(env, "device"), erts.enif_make_int(env, device), &map);
-    _ = erts.enif_make_map_put(env, map, erts.atom(env, "bytes"), bin_term, &map);
+    var bin: erts.ErlNifBinary = undefined;
+    _ = erts.enif_alloc_binary(@intCast(len), &bin);
+    if (len > 0) jni.getByteArrayRegion(jenv, bytes, 0, len, @ptrCast(bin.data));
+    const bin_term = erts.enif_make_binary(env, &bin);
+    const map = erts.makeMap(
+        env,
+        &.{ erts.atom(env, "device"), erts.atom(env, "bytes") },
+        &.{ erts.enif_make_int(env, @intCast(device)), bin_term },
+    ) orelse return;
     const msg = erts.makeTuple(env, .{ erts.atom(env, "midi"), erts.atom(env, "raw"), map });
     _ = erts.enif_send(null, &pid, env, msg);
 }
