@@ -39,12 +39,10 @@ defmodule MobMidi.MixProject do
       {:recon, "~> 2.5", only: [:dev, :test]},
       {:mob, "~> 0.7"},
       # BLE-MIDI (MobMidi.Ble) advertises the phone as a peripheral via
-      # MobBluetooth.Le — the generic GATT-peripheral primitive. USB-MIDI needs
-      # none of this; it's a compile-time dep only because the BLE transport
-      # module references it. TEMPORARY path dep on the unreleased
-      # feat/ble-peripheral worktree where MobBluetooth.Le lives; switch to
-      # `{:mob_bluetooth, "~> 0.2"}` once that ships on Hex.
-      {:mob_bluetooth, path: "/Users/kevin/code/mob_bluetooth/.claude/worktrees/ble-reintegrate"},
+      # MobBluetooth.Le — the GATT-peripheral primitive added in mob_bluetooth
+      # 0.3. USB-MIDI needs none of this; it's a compile-time dep only because
+      # the BLE transport module references it.
+      {:mob_bluetooth, "~> 0.3"},
       {:mob_dev, "~> 0.6", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
