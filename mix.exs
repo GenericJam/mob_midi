@@ -44,7 +44,7 @@ defmodule MobMidi.MixProject do
       # module references it. TEMPORARY path dep on the unreleased
       # feat/ble-peripheral worktree where MobBluetooth.Le lives; switch to
       # `{:mob_bluetooth, "~> 0.2"}` once that ships on Hex.
-      {:mob_bluetooth, path: "/Users/kevin/code/mob_bluetooth/.claude/worktrees/ble-peripheral"},
+      {:mob_bluetooth, path: "/Users/kevin/code/mob_bluetooth/.claude/worktrees/ble-reintegrate"},
       {:mob_dev, "~> 0.6", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
