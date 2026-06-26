@@ -29,7 +29,22 @@ defmodule MobMidi.KeyboardScreen do
   def mount(_params, _session, socket) do
     # TODO(orientation): once mob#49 lands -> Mob.Device.lock_orientation(:landscape)
     MobMidi.list_devices(socket)
-    {:ok, Mob.Socket.assign(socket, outputs: [], output: nil, last_sent: nil)}
+    # Advertise this phone as a BLE-MIDI peripheral so a computer can connect and
+    # be played by the keys (side-effect call, like list_devices; status arrives
+    # as :bt_le events). On the host this is a no-op.
+    MobMidi.Ble.advertise(socket, "Mob MIDI")
+    {:ok, Mob.Socket.assign(socket, outputs: [], output: nil, last_sent: nil, ble: "starting...")}
+  end
+
+  # Release the BLE-MIDI GATT server / advertiser on the way out. Without this,
+  # revisiting the screen leaks Android GATT-server registrations (which
+  # eventually exhaust the stack -> {:bt_le, :advertising_failed, %{reason:
+  # :no_gatt_server}}) and leaves an iOS peripheral advertising in the
+  # background.
+  @spec terminate(term(), term()) :: :ok
+  def terminate(_reason, socket) do
+    MobMidi.Ble.stop(socket)
+    :ok
   end
 
   @spec render(map()) :: map()
@@ -43,7 +58,12 @@ defmodule MobMidi.KeyboardScreen do
           props: %{background: :background, padding: :space_lg},
           children: [
             text("MIDI Keyboard", text_size: :xl, text_color: :on_surface, padding: :space_sm),
-            text("Tap a key to send a note out", text_size: :sm, text_color: :muted, padding: 4),
+            text("Tap a key to play a note over Bluetooth MIDI",
+              text_size: :sm,
+              text_color: :muted,
+              padding: 4
+            ),
+            text("Bluetooth: #{assigns.ble}", text_size: :sm, text_color: :primary, padding: 4),
             spacer(16),
             text("Output device", text_size: :sm, text_color: :muted, padding: 4),
             spacer(8),
@@ -77,6 +97,22 @@ defmodule MobMidi.KeyboardScreen do
     {:noreply, socket}
   end
 
+  # BLE-MIDI peripheral status (from MobBluetooth.Le, via MobMidi.Ble.advertise).
+  def handle_info({:bt_le, :advertising_started}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :ble, "advertising as 'Mob MIDI'")}
+
+  def handle_info({:bt_le, :advertising_failed, %{reason: reason}}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :ble, "BLE error: #{reason}")}
+
+  def handle_info({:bt_le, :subscribed, _}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :ble, "connected - computer is listening")}
+
+  def handle_info({:bt_le, :unsubscribed, _}, socket),
+    do: {:noreply, Mob.Socket.assign(socket, :ble, "advertising as 'Mob MIDI'")}
+
+  def handle_info({:bt_le, _evt, _payload}, socket), do: {:noreply, socket}
+  def handle_info({:bt_le, _evt}, socket), do: {:noreply, socket}
+
   def handle_info(_other, socket), do: {:noreply, socket}
 
   defp on_tap("o" <> id, socket) do
@@ -88,14 +124,20 @@ defmodule MobMidi.KeyboardScreen do
   defp on_tap("k" <> note, socket) do
     note = String.to_integer(note)
 
+    # Always play the note out over BLE-MIDI (to whatever computer subscribed),
+    # plus to a selected USB/wired output device if one is chosen.
+    ts = System.monotonic_time(:millisecond)
+    MobMidi.Ble.send_note_on(socket, @channel, note, @velocity, ts)
+    MobMidi.Ble.send_note_off(socket, @channel, note, 0, ts)
+
     case socket.assigns.output do
       nil ->
-        Mob.Socket.assign(socket, :last_sent, "select an output device first")
+        Mob.Socket.assign(socket, :last_sent, "note #{note} -> BLE")
 
       output ->
         MobMidi.send_note_on(socket, output, @channel, note, @velocity)
         MobMidi.send_note_off(socket, output, @channel, note, 0)
-        Mob.Socket.assign(socket, :last_sent, "note #{note} -> device #{output}")
+        Mob.Socket.assign(socket, :last_sent, "note #{note} -> BLE + device #{output}")
     end
   end
 
@@ -133,17 +175,21 @@ defmodule MobMidi.KeyboardScreen do
       props: %{fill_width: true},
       children:
         Enum.map(Enum.zip(@white_offsets, @white_names), fn {offset, name} ->
-          note = base + offset
-
-          button("#{name}#{octave + 3}", :"k#{note}",
-            background: :surface_raised,
-            text_color: :on_surface,
-            text_size: :sm,
-            padding: :space_sm,
-            weight: 1
-          )
+          key_button("#{name}#{octave + 3}", base + offset)
         end)
     }
+  end
+
+  # A piano key. Built with the ~MOB sigil + semantic theme tokens (NOT a
+  # plain-map button with literal-hex colors): that's the only thing that
+  # reliably renders a visible, *labelled* button on BOTH iOS and Android. iOS
+  # button styling ignores literal-hex backgrounds (the key shows as the
+  # background colour), and the plain-map + hex path dropped the labels — the
+  # sigil + tokens is the proven home-screen pattern.
+  defp key_button(label, note) do
+    tap = {self(), :"k#{note}"}
+
+    ~MOB(<Button text={label} background={:primary} text_color={:on_primary} text_size={:sm} padding={:space_md} weight={1} on_tap={tap} />)
   end
 
   defp sent_readout(nil), do: text("—", text_size: :sm, text_color: :muted, padding: 4)

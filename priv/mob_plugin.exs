@@ -31,8 +31,10 @@
     }
   },
   # Tier-3: demo screens the host auto-lists via Mob.Plugins.screens().
+  # Distinct first route segments so a host home that labels screens by the
+  # leading segment shows "Midi Keyboard" / "Midi Input" rather than two "Midi".
   screens: [
-    %{module: MobMidi.KeyboardScreen, default_route: "/midi/keyboard"},
-    %{module: MobMidi.InputScreen, default_route: "/midi/input"}
+    %{module: MobMidi.KeyboardScreen, default_route: "/midi_keyboard"},
+    %{module: MobMidi.InputScreen, default_route: "/midi_input"}
   ]
 }

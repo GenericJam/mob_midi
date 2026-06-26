@@ -107,8 +107,8 @@ defmodule MobMidiTest do
       {m, _} = Code.eval_file(Path.join(@plugin_dir, "priv/mob_plugin.exs"))
 
       routes = Enum.map(m.screens, & &1.default_route)
-      assert "/midi/keyboard" in routes
-      assert "/midi/input" in routes
+      assert "/midi_keyboard" in routes
+      assert "/midi_input" in routes
 
       langs = Enum.map(m.nifs, & &1.lang) |> Enum.sort()
       assert langs == [:objc, :zig]
