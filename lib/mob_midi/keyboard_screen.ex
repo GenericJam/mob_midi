@@ -33,7 +33,15 @@ defmodule MobMidi.KeyboardScreen do
     # be played by the keys (side-effect call, like list_devices; status arrives
     # as :bt_le events). On the host this is a no-op.
     MobMidi.Ble.advertise(socket, "Mob MIDI")
-    {:ok, Mob.Socket.assign(socket, outputs: [], output: nil, last_sent: nil, ble: "starting...")}
+
+    {:ok,
+     Mob.Socket.assign(socket,
+       outputs: [],
+       output: nil,
+       last_sent: nil,
+       last_recv: nil,
+       ble: "starting..."
+     )}
   end
 
   # Release the BLE-MIDI GATT server / advertiser on the way out. Without this,
@@ -73,7 +81,9 @@ defmodule MobMidi.KeyboardScreen do
             spacer(8),
             octave_row(1),
             spacer(20),
-            sent_readout(assigns.last_sent)
+            sent_readout(assigns.last_sent),
+            spacer(6),
+            recv_readout(assigns.last_recv)
           ]
         }
       ]
@@ -109,6 +119,14 @@ defmodule MobMidi.KeyboardScreen do
 
   def handle_info({:bt_le, :unsubscribed, _}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :ble, "advertising as 'Mob MIDI'")}
+
+  # MIDI IN over BLE: the connected computer wrote MIDI to us. Strip the
+  # BLE-MIDI framing, parse, and show what arrived (proves the receive path
+  # without a USB controller).
+  def handle_info({:bt_le, :write, %{bytes: bytes}}, socket) do
+    summary = bytes |> MobMidi.Ble.decode_packet() |> MobMidi.parse() |> describe_recv()
+    {:noreply, Mob.Socket.assign(socket, :last_recv, summary || socket.assigns.last_recv)}
+  end
 
   def handle_info({:bt_le, _evt, _payload}, socket), do: {:noreply, socket}
   def handle_info({:bt_le, _evt}, socket), do: {:noreply, socket}
@@ -194,6 +212,25 @@ defmodule MobMidi.KeyboardScreen do
 
   defp sent_readout(nil), do: text("—", text_size: :sm, text_color: :muted, padding: 4)
   defp sent_readout(t), do: text("sent: #{t}", text_size: :sm, text_color: :primary, padding: 4)
+
+  defp recv_readout(nil),
+    do: text("from computer: —", text_size: :sm, text_color: :muted, padding: 4)
+
+  defp recv_readout(t),
+    do: text("from computer: #{t}", text_size: :sm, text_color: :on_surface, padding: 4)
+
+  # Summarise parsed incoming MIDI events for the readout. Note on/off get a
+  # friendly form; anything else (cc, program_change, pitch_bend, raw) shows by
+  # type name.
+  defp describe_recv([]), do: nil
+
+  defp describe_recv(events) do
+    Enum.map_join(events, ", ", fn
+      %{type: :note_on, note: n, velocity: v} -> "on #{n} v#{v}"
+      %{type: :note_off, note: n} -> "off #{n}"
+      %{type: type} -> to_string(type)
+    end)
+  end
 
   defp text(t, props), do: %{type: :text, props: Map.new([{:text, t} | props]), children: []}
   defp spacer(n), do: %{type: :spacer, props: %{size: n}, children: []}
