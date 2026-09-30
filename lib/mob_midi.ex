@@ -219,11 +219,21 @@ defmodule MobMidi do
   end
 
   defp atomize_device(d) when is_map(d) do
+    d = normalize_keys(d, [:id, :name, :direction])
+
     %{
-      id: d[:id] || d["id"],
-      name: d[:name] || d["name"],
-      direction: direction_atom(d[:direction] || d["direction"])
+      id: d[:id],
+      name: d[:name],
+      direction: direction_atom(d[:direction])
     }
+  end
+
+  # Devices arrive with atom keys (native bridge) or string keys (JSON);
+  # fill each atom key from its string twin when the atom value is missing.
+  defp normalize_keys(d, keys) do
+    Enum.reduce(keys, d, fn key, acc ->
+      if acc[key], do: acc, else: Map.put(acc, key, Map.get(acc, Atom.to_string(key)))
+    end)
   end
 
   defp direction_atom("input"), do: :input
