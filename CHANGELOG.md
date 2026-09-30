@@ -6,6 +6,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [0.1.1] - 2026-09-30
+
+### Changed
+- **Re-signed with plugin envelope v2** (MOB-287). mob_dev 0.7.2+ verifies
+  this signature before evaluating the manifest. mob_dev 0.7.0 / 0.7.1 can't
+  read v2 signatures and report this release as `invalid signature` —
+  upgrade the host app to `{:mob_dev, "~> 0.7.2", only: :dev, runtime: false}`.
+  No plugin code changes.
+
 ## [0.1.0] - 2026-09-19
 
 ### Added
@@ -20,5 +29,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
     `parse_devices/1` to normalise the iOS list / Android JSON device payloads.
   - Tier-3 demo screens: `MobMidi.KeyboardScreen` (out; portrait-stubbed until
     mob's orientation lock lands) and `MobMidi.InputScreen` (in; visual).
-  - Native first pass (not yet device-verified): CoreMIDI NIF (iOS),
-    MidiManager Kotlin bridge + zig NIF (Android).
+    `MobMidi.KeyboardScreen` also sends notes over BLE-MIDI and shows incoming
+    BLE-MIDI from the connected central. The demo screens register distinct
+    routes, `/midi_keyboard` and `/midi_input`.
+  - `MobMidi.Ble`: BLE-MIDI transport. The phone advertises as a BLE-MIDI
+    peripheral (`advertise/2`, `stop/1`, `send_note_on/5`, `send_note_off/5`,
+    `send_cc/5`, `send_midi/3`), plus pure `encode_packet/2` /
+    `decode_packet/1` BLE-MIDI framing. Built on `MobBluetooth.Le`, so it adds
+    a `mob_bluetooth ~> 0.3` dependency.
+  - Native: CoreMIDI NIF (iOS), MidiManager Kotlin bridge + zig NIF (Android).
+    Device-verified with an M-Audio Oxygen 49 on both platforms.
