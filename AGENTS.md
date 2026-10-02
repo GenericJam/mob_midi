@@ -1,8 +1,8 @@
-# AGENTS.md — orientation for AI agents working on mob_midi
+# mob_midi — Agent Instructions
 
 You're in **mob_midi**, a Mob capability plugin: MIDI in + out over USB-MIDI and BLE-MIDI on both iOS (CoreMIDI) and Android (`android.media.midi`). Public API is `MobMidi.{list_devices, open_input, open_output, send_note_on, send_note_off, send_cc, send_raw, parse}/*`.
 
-**Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view and the cross-cutting pre-empt-failure rules. This file is mob_midi-specific.
+**Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view and the cross-cutting pre-empt-failure rules, and [`~/code/mob/MOB_PLUGINS.md`](../mob/MOB_PLUGINS.md) for the manifest schema. This file is mob_midi-specific.
 
 > **Keep this file current.** When you change API shape, add a `host_requirements` entry, or hit a gotcha that would trip the next agent, fix it here in the same commit — not in a follow-up.
 
@@ -50,13 +50,17 @@ Native / device testing needs actual MIDI hardware. Verified so far:
 
 ## Pre-commit + release
 
+Same gate as mob:
+
 ```bash
 mix format
-mix credo --strict
+mix credo --strict       # includes ExSlop + jump_credo_checks
 mix compile --warnings-as-errors
 mix test
 ```
 
-Native code isn't exercised by `mix test`; verify on real hardware before publishing.
+Native changes (`.m` / `.zig` / `.kt`) aren't exercised by `mix test` — they need a `mix mob.deploy --native` of a host app with real MIDI hardware (USB or BLE) attached, and a device check before committing (and before publishing).
 
-`mix.exs` version bump on master triggers Hex publish. Sign the manifest against the shared mob key first. Do NOT bump versions without explicit permission. See `~/code/mob/RELEASE.md`.
+The pre-push hook (`.githooks/pre-push`, activated via `git config core.hooksPath .githooks`) runs format/credo/compile on every push and the full suite when `mix.exs` changes (release preflight).
+
+Releases: `mix.exs` version bump on master triggers `.github/workflows/release.yml` (tag + GitHub Release + Hex publish). Sign the manifest against the shared mob key first. Do NOT bump versions without explicit permission. See [`~/code/mob/RELEASE.md`](../mob/RELEASE.md) for the trigger model.
