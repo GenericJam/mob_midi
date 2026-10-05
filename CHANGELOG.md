@@ -6,6 +6,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [0.1.2] - 2026-10-05
+
+Operator v1 release review fixes (MOB-397).
+
+### Changed
+- **`open_output/2` replies to its caller**: `{:midi, :opened, %{device: id,
+  direction: :output}}` once the port is ready, or `{:midi, :error, %{device:
+  id, op: :open_output, reason: atom, dropped: n}}` when it can't be opened
+  (`:no_such_device`, `:open_failed`, `:no_input_port`, ...). Same on iOS.
+- **Android queues sends made while an output is still opening** (up to 256
+  per device) and writes them in order once it opens. Before, the device opened
+  asynchronously and those sends were silently dropped, so the first notes
+  after `open_output/2` vanished. If the open fails the queue is discarded and
+  the error event's `dropped` counts the lost messages.
+- **`send_*` return `{:error, reason}` when nothing was written or queued**:
+  `:not_open` (no `open_output/2`, closed, or failed to open), `:queue_full`,
+  `:no_such_device` (iOS) or `:send_failed`. They still return `socket` on
+  success. iOS now requires `open_output/2` before sending, as Android did.
+- iOS `{:midi, :error, ...}` events from `open_input/2` carry `device`, `op`
+  and `dropped` alongside `reason`.
+- Android names devices that lack `PROPERTY_NAME` (virtual
+  `MidiDeviceService` devices) by manufacturer + product instead of "MIDI", and
+  opening a device for input and output shares one `MidiDevice`.
+- `MobMidi.KeyboardScreen` shows the selected output's state (opening / ready /
+  error) and a failed send.
+
+### Docs
+- The native paths are marked **experimental**: verified against virtual MIDI
+  devices on an Android emulator and the iOS simulator; USB-MIDI and BLE-MIDI
+  hardware unverified. Replaces the "first pass, not device-verified" wording.
+- Demo screen routes corrected to `/midi_keyboard` and `/midi_input`.
+- The send example waits for `:opened`.
+
 ## [0.1.1] - 2026-09-30
 
 ### Changed

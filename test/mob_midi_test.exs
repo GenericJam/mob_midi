@@ -80,6 +80,60 @@ defmodule MobMidiTest do
     end
   end
 
+  describe "send_result/2 (native send outcome)" do
+    setup do
+      %{socket: Mob.Socket.new(MobMidi.KeyboardScreen)}
+    end
+
+    test "written and queued sends both hand the socket back", %{socket: socket} do
+      assert MobMidi.send_result(socket, :ok) == socket
+      assert MobMidi.send_result(socket, :queued) == socket
+    end
+
+    test "a send that went nowhere is an error, not a silent no-op", %{socket: socket} do
+      assert MobMidi.send_result(socket, {:error, :not_open}) == {:error, :not_open}
+      assert MobMidi.send_result(socket, {:error, :queue_full}) == {:error, :queue_full}
+      assert MobMidi.send_result(socket, :error) == {:error, :send_failed}
+    end
+  end
+
+  describe "KeyboardScreen output events" do
+    setup do
+      socket =
+        MobMidi.KeyboardScreen
+        |> Mob.Socket.new()
+        |> Mob.Socket.assign(output: 7, output_status: "opening...")
+
+      %{socket: socket}
+    end
+
+    test ":opened for the selected output marks it ready", %{socket: socket} do
+      {:noreply, socket} =
+        MobMidi.KeyboardScreen.handle_info(
+          {:midi, :opened, %{device: 7, direction: :output}},
+          socket
+        )
+
+      assert socket.assigns.output_status == "ready"
+    end
+
+    test "an open_output error shows its reason", %{socket: socket} do
+      error = %{device: 7, op: :open_output, reason: :no_input_port, dropped: 2}
+      {:noreply, socket} = MobMidi.KeyboardScreen.handle_info({:midi, :error, error}, socket)
+      assert socket.assigns.output_status == "error: no_input_port"
+    end
+
+    test "a late reply for a previously selected output is ignored", %{socket: socket} do
+      {:noreply, socket} =
+        MobMidi.KeyboardScreen.handle_info(
+          {:midi, :opened, %{device: 3, direction: :output}},
+          socket
+        )
+
+      assert socket.assigns.output_status == "opening..."
+    end
+  end
+
   describe "platform gating" do
     test "MobMidi is supported on ios + android, not the host" do
       refute MobMidi.Platform.unsupported?(:ios)

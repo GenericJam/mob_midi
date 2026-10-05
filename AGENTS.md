@@ -35,10 +35,11 @@ mix test
 
 The suite exercises `parse/1` heavily — that's the pure decoder and it should decode every MIDI status byte correctly (note on with velocity 0 normalizes to note off, running-status is handled, unknown bytes get `:raw`).
 
-Native / device testing needs actual MIDI hardware. Verified so far:
+Native paths are **experimental** (README "Status"). No hardware needed for the core I/O loop: virtual MIDI devices exercise it end to end.
 
-* **USB-MIDI** on both platforms with an M-Audio Oxygen 49 keyboard.
-* **BLE-MIDI** unverified end-to-end at time of writing (Elixir + screens green; native paths not device-verified).
+* **Android emulator:** add `android.media.midi.MidiDeviceService` subclasses to a throwaway host app (a service + `res/xml` device-info + a `<service>` with the `android.media.midi.MidiDeviceService` intent-filter and `BIND_MIDI_DEVICE_SERVICE` permission). A "synth" with only an input port that forwards to a "source" with only an output port lets you `open_input(source)`, then `open_output(synth)` fresh and send immediately (exercises the queue). Sleeping in the synth's `onCreate` delays the open (it shares the main looper with the `openDevice` callback), which exercises the 256-message bound. Drive it over `mix mob.connect --no-iex` + `:rpc.call(node, Code, :eval_string, [src])` so the NIF messages land in the eval process.
+* **iOS simulator:** in the host's `ios/AppDelegate.m`, `MIDIDestinationCreate` a synth whose read proc `MIDIReceived`s into a `MIDISourceCreate` source.
+* **USB-MIDI / BLE-MIDI hardware:** not verified for 0.1.2 (an earlier Oxygen 49 check is noted in the 0.1.0 changelog but predates the 0.1.2 bridge changes).
 
 ## The pre-empt-failure rules that matter here
 
@@ -46,7 +47,8 @@ Native / device testing needs actual MIDI hardware. Verified so far:
 2. **Note on with velocity 0 is note off** by MIDI convention. `parse/1` normalises this; if you're implementing new MIDI decoding paths, keep that normalisation — otherwise sustained-note bugs will chase you forever.
 3. **`send_raw/3` accepts binaries** — used for SysEx, MTC, or any status the typed helpers don't cover. Do NOT hand-craft note messages via `send_raw`; the typed helpers exist for a reason (clipping channel to 0..15, byte7 args to 0..127).
 4. **Channel numbering:** `0..15` on the wire; most UIs show `1..16`. Do not silently offset — that's a UX decision the app makes.
-5. **Hot-plug is asynchronous.** Devices added/removed arrive as `{:midi, :device_added | :device_removed, ...}` messages. A `list_devices` snapshot goes stale the moment it's returned; treat the callback stream as the source of truth if you're building a UI.
+5. **Hot-plug is asynchronous and iOS-only.** iOS sends `{:midi, :device_added | :device_removed, nil}` to the last `list_devices` caller; Android doesn't deliver hot-plug events yet. A `list_devices` snapshot goes stale the moment it's returned.
+6. **`open_output/2` replies; `send_*` can fail.** The caller gets `{:midi, :opened, ...}` or `{:midi, :error, %{op: :open_output, ...}}`. Android opens asynchronously and queues up to 256 sends per device until then (`MobMidiBridge.MAX_PENDING_SENDS`); the NIF answers `:ok | :queued | {:error, reason}` and `MobMidi.send_result/2` maps that. Keep the Kotlin `SEND_*` codes and the zig switch in `nif_midi_send` in step.
 
 ## Pre-commit + release
 
@@ -59,7 +61,7 @@ mix compile --warnings-as-errors
 mix test
 ```
 
-Native changes (`.m` / `.zig` / `.kt`) aren't exercised by `mix test` — they need a `mix mob.deploy --native` of a host app with real MIDI hardware (USB or BLE) attached, and a device check before committing (and before publishing).
+Native changes (`.m` / `.zig` / `.kt`) aren't exercised by `mix test` — they need a `mix mob.deploy --native` of a host app and a device check (virtual MIDI devices on an emulator/simulator, see Testing; real USB/BLE hardware where you have it) before committing and before publishing.
 
 The pre-push hook (`.githooks/pre-push`, activated via `git config core.hooksPath .githooks`) runs format/credo/compile on every push and the full suite when `mix.exs` changes (release preflight).
 

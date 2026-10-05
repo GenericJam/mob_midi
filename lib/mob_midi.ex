@@ -18,7 +18,10 @@ defmodule MobMidi do
       MobMidi.list_devices(socket)
       # => {:midi, :devices, [%{id: 1, name: "Oxygen 49", direction: :input}, ...]}
 
-  Hot-plug: `{:midi, :device_added, device}` / `{:midi, :device_removed, id}`.
+  Hot-plug: on iOS a device appearing / disappearing sends
+  `{:midi, :device_added, nil}` / `{:midi, :device_removed, nil}` to the last
+  `list_devices/1` caller; re-list on either. Android doesn't deliver hot-plug
+  events yet, so re-run `list_devices/1` there.
 
   ## Receiving
 
@@ -43,14 +46,47 @@ defmodule MobMidi do
 
   ## Sending
 
+  Open the output first. `open_output/2` replies to the calling process with
+  `{:midi, :opened, %{device: id, direction: :output}}` once the port is ready,
+  or `{:midi, :error, %{device: id, op: :open_output, reason: reason, dropped:
+  n}}` if it can't be opened:
+
       MobMidi.open_output(socket, device_id)
-      MobMidi.send_note_on(socket, device_id, 0, 60, 100)   # ch 0, middle C, vel 100
-      MobMidi.send_note_off(socket, device_id, 0, 60, 0)
-      MobMidi.send_cc(socket, device_id, 0, 7, 90)          # ch 0, CC#7 (volume)
-      MobMidi.send_raw(socket, device_id, <<0xF0, ...>>)    # SysEx / anything
+
+      def handle_info({:midi, :opened, %{device: id}}, socket) do
+        MobMidi.send_note_on(socket, id, 0, 60, 100)   # ch 0, middle C, vel 100
+        MobMidi.send_note_off(socket, id, 0, 60, 0)
+        MobMidi.send_cc(socket, id, 0, 7, 90)          # ch 0, CC#7 (volume)
+        MobMidi.send_raw(socket, id, <<0xF0, ...>>)    # SysEx / anything
+        {:noreply, socket}
+      end
+
+      def handle_info({:midi, :error, %{op: :open_output, reason: reason}}, socket),
+        do: {:noreply, Mob.Socket.assign(socket, :midi_error, reason)}
+
+  You don't have to wait for `:opened`: Android opens the port asynchronously,
+  and sends made before it opens are queued (up to 256 messages per device)
+  and written in order the moment it does. If the open fails, the queue is
+  discarded and the error event's `dropped` says how many messages were lost.
+  iOS opens synchronously, so the event arrives before `open_output/2` returns.
+
+  `send_*` return `socket` when the message was written or queued, and
+  `{:error, reason}` when it wasn't: `:not_open` (no `open_output/2` for that
+  device, or it was closed or failed to open), `:queue_full`, `:no_such_device`
+  (iOS: the destination disappeared) or `:send_failed`.
 
   Channels are `0..15` on the wire (shown as 1..16 in most UIs). Notes /
   velocities / values are `0..127`.
+
+  ## Status: experimental
+
+  The native MIDI paths are experimental. Verified for 0.1.2 against virtual
+  MIDI devices: on an Android emulator (`android.media.midi.MidiDeviceService`
+  loopbacks in a test host app) and on the iOS simulator (CoreMIDI virtual
+  endpoints), covering `list_devices/1`, `open_output/2` and its events, sends
+  queued before the port opened (Android), `send_*` errors, `open_input/2`
+  receive and `close/2`. Not verified: USB-MIDI and BLE-MIDI hardware on either
+  platform, including `MobMidi.Ble`. Android uses port 0 of each device.
   """
 
   import Bitwise
@@ -76,7 +112,15 @@ defmodule MobMidi do
     guarded(socket, fn -> :mob_midi_nif.midi_open_input(device_id) end)
   end
 
-  @doc "Open a device's MIDI output so `send_*` can write to it."
+  @doc """
+  Open a device's MIDI output so `send_*` can write to it.
+
+  The calling process receives `{:midi, :opened, %{device: id, direction:
+  :output}}` when the port is ready, or `{:midi, :error, %{device: id, op:
+  :open_output, reason: reason, dropped: n}}` when it can't be opened (reasons
+  include `:no_such_device`, `:open_failed`, `:no_input_port`). Sends made
+  before `:opened` are queued and flushed in order; see "Sending" above.
+  """
   @spec open_output(term(), device_id()) :: term()
   def open_output(socket, device_id) when is_integer(device_id) do
     guarded(socket, fn -> :mob_midi_nif.midi_open_output(device_id) end)
@@ -112,11 +156,28 @@ defmodule MobMidi do
     send_raw(socket, device_id, program_change_bytes(channel, program))
   end
 
-  @doc "Send raw MIDI bytes (SysEx, or anything `send_*` doesn't cover)."
+  @doc """
+  Send raw MIDI bytes (SysEx, or anything `send_*` doesn't cover).
+
+  Returns `socket` when the bytes were written, or queued while the output is
+  still opening; `{:error, reason}` when they weren't (see "Sending" above).
+  """
   @spec send_raw(term(), device_id(), binary()) :: term()
   def send_raw(socket, device_id, bytes) when is_integer(device_id) and is_binary(bytes) do
-    guarded(socket, fn -> :mob_midi_nif.midi_send(device_id, bytes) end)
+    if MobMidi.Platform.unsupported?(MobMidi.Platform.current()) do
+      {:error, :unsupported}
+    else
+      send_result(socket, :mob_midi_nif.midi_send(device_id, bytes))
+    end
   end
+
+  # The NIF answers :ok (written), :queued (Android output still opening),
+  # {:error, reason}, or a bare :error when it couldn't reach the JVM.
+  @doc false
+  @spec send_result(term(), term()) :: term()
+  def send_result(socket, result) when result in [:ok, :queued], do: socket
+  def send_result(_socket, {:error, reason}) when is_atom(reason), do: {:error, reason}
+  def send_result(_socket, :error), do: {:error, :send_failed}
 
   # ── Pure message encoders (testable; status nibble | channel) ───────────
 

@@ -6,18 +6,23 @@
  *
  * Device ids are CoreMIDI endpoint unique IDs (kMIDIPropertyUniqueID, an
  * SInt32) so they're stable across the BEAM boundary. Incoming packets and the
- * device list are delivered to the pid that called open_input / list_devices
- * (captured via enif_self), as:
+ * device list are delivered to the pid that called open_input / list_devices,
+ * and open_output's result to its caller (captured via enif_self), as:
  *
  *   {:midi, :devices, [%{id, name, direction}]}
  *   {:midi, :raw, %{device: id, bytes: <<...>>}}
  *   {:midi, :device_added | :device_removed, id_or_device}
- *   {:midi, :error, %{reason: atom}}
+ *   {:midi, :opened, %{device: id, direction: :output}}
+ *   {:midi, :error, %{device: id, op: atom, reason: atom, dropped: 0}}
  *
- * FIRST PASS — written against the CoreMIDI API but not yet device-verified.
+ * open_output resolves the destination synchronously, so (unlike Android)
+ * there is nothing to queue: :opened / :error is sent before it returns.
+ * midi_send returns :ok or {:error, :not_open | :no_such_device |
+ * :send_failed}; a destination must be opened first, as on Android.
+ *
  * Compiled as ObjC (-fobjc-arc) via the plugin objc-NIF path (manifest
- * lang: :objc, platform: :ios). CoreMIDI needs a real radio/port, so it does
- * nothing meaningful on the simulator.
+ * lang: :objc, platform: :ios). Hardware endpoints need a device; virtual
+ * endpoints (MIDISourceCreate / MIDIDestinationCreate) work on the simulator.
  */
 #import <CoreMIDI/CoreMIDI.h>
 #import <Foundation/Foundation.h>
@@ -34,6 +39,9 @@ static ErlNifPid g_input_pid;
 static BOOL g_have_input_pid = NO;
 static ErlNifPid g_list_pid;
 static BOOL g_have_list_pid = NO;
+
+// Destination uids opened via open_output; guarded by @synchronized on itself.
+static NSMutableSet<NSNumber *> *g_open_outputs = nil;
 
 // ── delivery helpers ──────────────────────────────────────────────────────
 
@@ -60,15 +68,58 @@ static void midi_send_raw(const ErlNifPid *pid, SInt32 device,
   enif_free_env(e);
 }
 
-static void midi_send_error(const ErlNifPid *pid, const char *reason) {
+static void midi_send_error(const ErlNifPid *pid, SInt32 device, const char *op,
+                            const char *reason) {
   if (!pid)
     return;
   ErlNifEnv *e = enif_alloc_env();
   ERL_NIF_TERM map = enif_make_new_map(e);
+  enif_make_map_put(e, map, enif_make_atom(e, "device"),
+                    enif_make_int(e, device), &map);
+  enif_make_map_put(e, map, enif_make_atom(e, "op"), enif_make_atom(e, op),
+                    &map);
   enif_make_map_put(e, map, enif_make_atom(e, "reason"),
                     enif_make_atom(e, reason), &map);
+  enif_make_map_put(e, map, enif_make_atom(e, "dropped"), enif_make_int(e, 0),
+                    &map);
   enif_send(NULL, (ErlNifPid *)pid, e, midi_env3(e, "error", map));
   enif_free_env(e);
+}
+
+static void midi_send_opened(const ErlNifPid *pid, SInt32 device) {
+  ErlNifEnv *e = enif_alloc_env();
+  ERL_NIF_TERM map = enif_make_new_map(e);
+  enif_make_map_put(e, map, enif_make_atom(e, "device"),
+                    enif_make_int(e, device), &map);
+  enif_make_map_put(e, map, enif_make_atom(e, "direction"),
+                    enif_make_atom(e, "output"), &map);
+  enif_send(NULL, (ErlNifPid *)pid, e, midi_env3(e, "opened", map));
+  enif_free_env(e);
+}
+
+static NSMutableSet<NSNumber *> *open_outputs(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    g_open_outputs = [NSMutableSet set];
+  });
+  return g_open_outputs;
+}
+
+static void set_output_open(SInt32 uid, BOOL open) {
+  NSMutableSet<NSNumber *> *set = open_outputs();
+  @synchronized(set) {
+    if (open)
+      [set addObject:@(uid)];
+    else
+      [set removeObject:@(uid)];
+  }
+}
+
+static BOOL output_is_open(SInt32 uid) {
+  NSMutableSet<NSNumber *> *set = open_outputs();
+  @synchronized(set) {
+    return [set containsObject:@(uid)];
+  }
 }
 
 static SInt32 endpoint_uid(MIDIEndpointRef ep) {
@@ -200,12 +251,12 @@ static ERL_NIF_TERM nif_open_input(ErlNifEnv *env, int argc,
   enif_self(env, &g_input_pid);
   g_have_input_pid = YES;
   if (!ensure_client()) {
-    midi_send_error(&g_input_pid, "no_client");
+    midi_send_error(&g_input_pid, (SInt32)uid, "open_input", "no_client");
     return enif_make_atom(env, "ok");
   }
   MIDIEndpointRef src = source_for_uid((SInt32)uid);
   if (src == 0) {
-    midi_send_error(&g_input_pid, "no_such_device");
+    midi_send_error(&g_input_pid, (SInt32)uid, "open_input", "no_such_device");
     return enif_make_atom(env, "ok");
   }
   MIDIPortConnectSource(g_in_port, src, (void *)(intptr_t)uid);
@@ -215,10 +266,23 @@ static ERL_NIF_TERM nif_open_input(ErlNifEnv *env, int argc,
 static ERL_NIF_TERM nif_open_output(ErlNifEnv *env, int argc,
                                     const ERL_NIF_TERM argv[]) {
   (void)argc;
-  (void)argv;
-  // Output is a shared port; sending targets a destination by id. Just ensure
-  // the client/port exist.
-  ensure_client();
+  int uid;
+  if (!enif_get_int(env, argv[0], &uid))
+    return enif_make_badarg(env);
+  ErlNifPid pid;
+  enif_self(env, &pid);
+  // Output is a shared port; sending targets a destination by uid. Opening
+  // checks the destination exists and marks it sendable.
+  if (!ensure_client()) {
+    midi_send_error(&pid, (SInt32)uid, "open_output", "no_client");
+    return enif_make_atom(env, "ok");
+  }
+  if (dest_for_uid((SInt32)uid) == 0) {
+    midi_send_error(&pid, (SInt32)uid, "open_output", "no_such_device");
+    return enif_make_atom(env, "ok");
+  }
+  set_output_open((SInt32)uid, YES);
+  midi_send_opened(&pid, (SInt32)uid);
   return enif_make_atom(env, "ok");
 }
 
@@ -228,6 +292,7 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc,
   int uid;
   if (!enif_get_int(env, argv[0], &uid))
     return enif_make_badarg(env);
+  set_output_open((SInt32)uid, NO);
   MIDIEndpointRef src = source_for_uid((SInt32)uid);
   if (src && g_in_port)
     MIDIPortDisconnectSource(g_in_port, src);
@@ -244,18 +309,22 @@ static ERL_NIF_TERM nif_send(ErlNifEnv *env, int argc,
   if (!enif_inspect_binary(env, argv[1], &bin) &&
       !enif_inspect_iolist_as_binary(env, argv[1], &bin))
     return enif_make_badarg(env);
-  if (!ensure_client())
-    return enif_make_atom(env, "ok");
+  if (!output_is_open((SInt32)uid))
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "not_open"));
   MIDIEndpointRef dest = dest_for_uid((SInt32)uid);
   if (dest == 0)
-    return enif_make_atom(env, "ok");
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "no_such_device"));
 
   Byte buffer[512];
   MIDIPacketList *pktlist = (MIDIPacketList *)buffer;
   MIDIPacket *pkt = MIDIPacketListInit(pktlist);
   size_t len = bin.size > 256 ? 256 : bin.size;
   MIDIPacketListAdd(pktlist, sizeof(buffer), pkt, 0, len, bin.data);
-  MIDISend(g_out_port, dest, pktlist);
+  if (MIDISend(g_out_port, dest, pktlist) != noErr)
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "send_failed"));
   return enif_make_atom(env, "ok");
 }
 
