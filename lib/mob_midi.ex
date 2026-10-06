@@ -74,7 +74,8 @@ defmodule MobMidi do
   `{:error, reason}` when it wasn't: `:not_open` (no `open_output/2` for that
   device, or it was closed or failed to open), `:queue_full`, `:no_such_device`
   (iOS: the destination disappeared), `:too_large` (iOS: over 256 bytes in one
-  send) or `:send_failed`; `{:error, :unsupported}` on the host. So bind the
+  send) or `:send_failed`; `{:error, :unsupported}` on the host and
+  `{:error, :nif_not_loaded}` if the native bridge isn't registered. So bind the
   result rather than piping it on as the socket.
 
   Channels are `0..15` on the wire (shown as 1..16 in most UIs). Notes /

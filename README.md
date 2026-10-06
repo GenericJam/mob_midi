@@ -72,5 +72,6 @@ Not verified: USB-MIDI and BLE-MIDI hardware on either platform (including the
 `MobMidi.Ble` peripheral). Android assumes a single port per device (port 0).
 
 Activating both mob_midi and mob_bluetooth: both declare
-`NSBluetoothAlwaysUsageDescription`, so set that key in the host's
-`ios/Info.plist` (the host's value wins and the plugins don't conflict).
+`NSBluetoothAlwaysUsageDescription`, and mob_dev (0.7.14) refuses the native
+build when two activated plugins declare the same key. Set it in the host's
+`ios/Info.plist`: the host's value wins and the plugins no longer conflict.

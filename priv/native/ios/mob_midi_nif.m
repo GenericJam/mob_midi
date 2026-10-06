@@ -18,7 +18,8 @@
  * open_output resolves the destination synchronously, so (unlike Android)
  * there is nothing to queue: :opened / :error is sent before it returns.
  * midi_send returns :ok or {:error, :not_open | :no_such_device |
- * :send_failed}; a destination must be opened first, as on Android.
+ * :too_large | :send_failed}; a destination must be opened first, as on
+ * Android.
  *
  * Compiled as ObjC (-fobjc-arc) via the plugin objc-NIF path (manifest
  * lang: :objc, platform: :ios). Hardware endpoints need a device; virtual

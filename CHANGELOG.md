@@ -13,9 +13,11 @@ Operator v1 release review fixes (MOB-397).
 ### Changed
 - **`open_output/2` replies to its caller**: `{:midi, :opened, %{device: id,
   direction: :output}}` once the port is ready, or `{:midi, :error, %{device:
-  id, op: :open_output, reason: atom, dropped: n}}` when it can't be opened
-  (`:no_such_device`, `:open_failed`, `:no_input_port`, `:closed` when
-  `close/2` cancels an open in flight). Same on iOS.
+  id, op: :open_output, reason: atom, dropped: n}}` when it can't be opened,
+  on both platforms. Reasons include `:no_such_device` (both), `:no_client`
+  (iOS), and on Android `:no_midi_service`, `:open_failed`, `:no_input_port`,
+  `:send_failed` (queue flush failed) and `:closed` (`close/2` cancelled an
+  open in flight).
 - **Android queues sends made while an output is still opening** (up to 256
   per device) and writes them in order once it opens. Before, the device opened
   asynchronously and those sends were silently dropped, so the first notes
