@@ -6,6 +6,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [0.1.2] - 2026-10-05
+
+Operator v1 release review fixes (MOB-397).
+
+### Changed
+- **`open_output/2` replies to its caller**: `{:midi, :opened, %{device: id,
+  direction: :output}}` once the port is ready, or `{:midi, :error, %{device:
+  id, op: :open_output, reason: atom, dropped: n}}` when it can't be opened,
+  on both platforms. Reasons include `:no_such_device` (both), `:no_client`
+  (iOS), and on Android `:no_midi_service`, `:open_failed`, `:no_input_port`,
+  `:send_failed` (queue flush failed) and `:closed` (`close/2` cancelled an
+  open in flight).
+- **Android queues sends made while an output is still opening** (up to 256
+  per device) and writes them in order once it opens. Before, the device opened
+  asynchronously and those sends were silently dropped, so the first notes
+  after `open_output/2` vanished. If the open fails the queue is discarded and
+  the error event's `dropped` counts the lost messages.
+- **Breaking: `send_*` return `{:error, reason}` when nothing was written or
+  queued**, where 0.1.1 returned `socket` and silently dropped the message:
+  `:not_open` (no `open_output/2`, closed, or failed to open), `:queue_full`,
+  `:no_such_device` (iOS), `:too_large` (iOS, over 256 bytes; 0.1.1 truncated)
+  or `:send_failed`. They still return `socket` on success. Code that pipes a
+  `send_*` result on as the socket must bind it instead.
+- **Breaking (iOS): `open_output/2` is required before sending**, as it already
+  was on Android; 0.1.1's iOS NIF sent to any destination.
+- iOS `{:midi, :error, ...}` events from `open_input/2` carry `device`, `op`
+  and `dropped` alongside `reason`.
+- Android names devices that lack `PROPERTY_NAME` (virtual
+  `MidiDeviceService` devices) by manufacturer + product instead of "MIDI", and
+  opening a device for input and output shares one `MidiDevice`.
+- `MobMidi.KeyboardScreen` shows the selected output's state (opening / ready /
+  error) and a failed send.
+
+### Docs
+- The native paths are marked **experimental**: verified against virtual MIDI
+  devices on an Android emulator and the iOS simulator; USB-MIDI and BLE-MIDI
+  hardware unverified. Replaces the "first pass, not device-verified" wording.
+- Demo screen routes corrected to `/midi_keyboard` and `/midi_input`.
+- The send example waits for `:opened`.
+- README notes that a host activating both mob_midi and mob_bluetooth must set
+  `NSBluetoothAlwaysUsageDescription` in its own `ios/Info.plist` (both plugins
+  declare it; mob_dev 0.7.14 refuses the build otherwise).
+
 ## [0.1.1] - 2026-09-30
 
 ### Changed

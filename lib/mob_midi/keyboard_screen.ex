@@ -38,6 +38,7 @@ defmodule MobMidi.KeyboardScreen do
      Mob.Socket.assign(socket,
        outputs: [],
        output: nil,
+       output_status: nil,
        last_sent: nil,
        last_recv: nil,
        ble: "starting..."
@@ -76,6 +77,7 @@ defmodule MobMidi.KeyboardScreen do
             text("Output device", text_size: :sm, text_color: :muted, padding: 4),
             spacer(8),
             output_picker(assigns.outputs, assigns.output),
+            output_status(assigns.output_status),
             spacer(24),
             octave_row(0),
             spacer(8),
@@ -107,6 +109,16 @@ defmodule MobMidi.KeyboardScreen do
     {:noreply, socket}
   end
 
+  # open_output/2 replies once the port exists (or can't). Notes tapped before
+  # then are queued natively and flushed on open, so this is status only.
+  def handle_info({:midi, :opened, %{device: id}}, socket) do
+    {:noreply, set_output_status(socket, id, "ready")}
+  end
+
+  def handle_info({:midi, :error, %{op: :open_output, device: id, reason: reason}}, socket) do
+    {:noreply, set_output_status(socket, id, "error: #{reason}")}
+  end
+
   # BLE-MIDI peripheral status (from MobBluetooth.Le, via MobMidi.Ble.advertise).
   def handle_info({:bt_le, :advertising_started}, socket),
     do: {:noreply, Mob.Socket.assign(socket, :ble, "advertising as 'Mob MIDI'")}
@@ -136,7 +148,7 @@ defmodule MobMidi.KeyboardScreen do
   defp on_tap("o" <> id, socket) do
     output = String.to_integer(id)
     MobMidi.open_output(socket, output)
-    Mob.Socket.assign(socket, :output, output)
+    Mob.Socket.assign(socket, output: output, output_status: "opening...")
   end
 
   defp on_tap("k" <> note, socket) do
@@ -153,13 +165,27 @@ defmodule MobMidi.KeyboardScreen do
         Mob.Socket.assign(socket, :last_sent, "note #{note} -> BLE")
 
       output ->
-        MobMidi.send_note_on(socket, output, @channel, note, @velocity)
+        on = MobMidi.send_note_on(socket, output, @channel, note, @velocity)
         MobMidi.send_note_off(socket, output, @channel, note, 0)
-        Mob.Socket.assign(socket, :last_sent, "note #{note} -> BLE + device #{output}")
+
+        sent =
+          case on do
+            {:error, reason} -> "note #{note} -> BLE; device #{output} failed: #{reason}"
+            _socket -> "note #{note} -> BLE + device #{output}"
+          end
+
+        Mob.Socket.assign(socket, :last_sent, sent)
     end
   end
 
   defp on_tap(_other, socket), do: socket
+
+  # Ignore replies for an output the user has since switched away from.
+  defp set_output_status(socket, id, status) do
+    if socket.assigns.output == id,
+      do: Mob.Socket.assign(socket, :output_status, status),
+      else: socket
+  end
 
   # ── Render helpers (plain node maps) ────────────────────────────────────────
 
@@ -183,6 +209,11 @@ defmodule MobMidi.KeyboardScreen do
         end)
     }
   end
+
+  defp output_status(nil), do: spacer(0)
+
+  defp output_status(status),
+    do: text("output: #{status}", text_size: :sm, text_color: :primary, padding: 4)
 
   # TODO(orientation): in landscape this becomes one wide row with black keys.
   defp octave_row(octave) do
