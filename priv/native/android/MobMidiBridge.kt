@@ -111,7 +111,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
                 cb(null)
             } else {
                 val prev = openDevices.putIfAbsent(info.id, device)
-                if (prev != null) device.close()
+                if (prev != null) closeQuietly(device)
                 cb(prev ?: device)
             }
         }, main)
@@ -157,7 +157,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
         withDevice(mm, info) { device ->
             if (device == null) return@withDevice
             val out = device.openOutputPort(0) ?: return@withDevice
-            outputPorts.put(deviceId, out)?.close()
+            closeQuietly(outputPorts.put(deviceId, out))
             out.connect(object : MidiReceiver() {
                 override fun onSend(msg: ByteArray, offset: Int, count: Int, timestamp: Long) {
                     val chunk = msg.copyOfRange(offset, offset + count)
@@ -203,7 +203,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
             val pending = pendingOutputs.remove(deviceId)
             when {
                 // close() ran while we were opening: nobody wants this port.
-                pending == null -> port?.close()
+                pending == null -> closeQuietly(port)
                 device == null -> failure = "open_failed"
                 port == null -> failure = "no_input_port"
                 else ->
@@ -216,7 +216,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
                         }
                         inputPorts[deviceId] = port
                     } catch (e: IOException) {
-                        port.close()
+                        closeQuietly(port)
                         failure = "send_failed"
                     }
             }
@@ -239,7 +239,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
     private fun releaseUnusedDevice(deviceId: Int) {
         val inUse = outputPorts.containsKey(deviceId) ||
             synchronized(sendLock) { inputPorts.containsKey(deviceId) }
-        if (!inUse) openDevices.remove(deviceId)?.close()
+        if (!inUse) closeQuietly(openDevices.remove(deviceId))
     }
 
     @JvmStatic
@@ -265,14 +265,33 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
         }
     }
 
+    // close() during an in-flight open cancels it: waiting openers get
+    // {:midi, :error, %{reason: :closed, dropped: n}} and the late openDevice
+    // callback finds no pending entry and releases the device.
     @JvmStatic
     fun close(deviceId: Int) {
+        var cancelled: PendingOutput? = null
         val port = synchronized(sendLock) {
-            pendingOutputs.remove(deviceId)
+            cancelled = pendingOutputs.remove(deviceId)
             inputPorts.remove(deviceId)
         }
-        port?.close()
-        outputPorts.remove(deviceId)?.close()
-        openDevices.remove(deviceId)?.close()
+        closeQuietly(port)
+        closeQuietly(outputPorts.remove(deviceId))
+        closeQuietly(openDevices.remove(deviceId))
+        cancelled?.let { pending ->
+            for (pid in pending.pids) {
+                nativeDeliverMidiError(pid, deviceId, "open_output", "closed", pending.queue.size)
+            }
+        }
+    }
+
+    // close() on ports/devices is declared to throw IOException; never let one
+    // escape into JNI on a BEAM scheduler thread.
+    private fun closeQuietly(c: java.io.Closeable?) {
+        try {
+            c?.close()
+        } catch (e: IOException) {
+            // Already gone; nothing left to release.
+        }
     }
 }

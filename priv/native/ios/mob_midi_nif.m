@@ -11,7 +11,7 @@
  *
  *   {:midi, :devices, [%{id, name, direction}]}
  *   {:midi, :raw, %{device: id, bytes: <<...>>}}
- *   {:midi, :device_added | :device_removed, id_or_device}
+ *   {:midi, :device_added | :device_removed, nil}
  *   {:midi, :opened, %{device: id, direction: :output}}
  *   {:midi, :error, %{device: id, op: atom, reason: atom, dropped: 0}}
  *
@@ -68,7 +68,10 @@ static void midi_send_raw(const ErlNifPid *pid, SInt32 device,
   enif_free_env(e);
 }
 
-static void midi_send_error(const ErlNifPid *pid, SInt32 device, const char *op,
+// Both are only called from inside a NIF, so they pass the caller's env to
+// enif_send (NULL is for threads ERTS doesn't manage).
+static void midi_send_error(ErlNifEnv *caller, const ErlNifPid *pid,
+                            SInt32 device, const char *op,
                             const char *reason) {
   if (!pid)
     return;
@@ -82,18 +85,19 @@ static void midi_send_error(const ErlNifPid *pid, SInt32 device, const char *op,
                     enif_make_atom(e, reason), &map);
   enif_make_map_put(e, map, enif_make_atom(e, "dropped"), enif_make_int(e, 0),
                     &map);
-  enif_send(NULL, (ErlNifPid *)pid, e, midi_env3(e, "error", map));
+  enif_send(caller, (ErlNifPid *)pid, e, midi_env3(e, "error", map));
   enif_free_env(e);
 }
 
-static void midi_send_opened(const ErlNifPid *pid, SInt32 device) {
+static void midi_send_opened(ErlNifEnv *caller, const ErlNifPid *pid,
+                             SInt32 device) {
   ErlNifEnv *e = enif_alloc_env();
   ERL_NIF_TERM map = enif_make_new_map(e);
   enif_make_map_put(e, map, enif_make_atom(e, "device"),
                     enif_make_int(e, device), &map);
   enif_make_map_put(e, map, enif_make_atom(e, "direction"),
                     enif_make_atom(e, "output"), &map);
-  enif_send(NULL, (ErlNifPid *)pid, e, midi_env3(e, "opened", map));
+  enif_send(caller, (ErlNifPid *)pid, e, midi_env3(e, "opened", map));
   enif_free_env(e);
 }
 
@@ -251,12 +255,12 @@ static ERL_NIF_TERM nif_open_input(ErlNifEnv *env, int argc,
   enif_self(env, &g_input_pid);
   g_have_input_pid = YES;
   if (!ensure_client()) {
-    midi_send_error(&g_input_pid, (SInt32)uid, "open_input", "no_client");
+    midi_send_error(env, &g_input_pid, (SInt32)uid, "open_input", "no_client");
     return enif_make_atom(env, "ok");
   }
   MIDIEndpointRef src = source_for_uid((SInt32)uid);
   if (src == 0) {
-    midi_send_error(&g_input_pid, (SInt32)uid, "open_input", "no_such_device");
+    midi_send_error(env, &g_input_pid, (SInt32)uid, "open_input", "no_such_device");
     return enif_make_atom(env, "ok");
   }
   MIDIPortConnectSource(g_in_port, src, (void *)(intptr_t)uid);
@@ -274,15 +278,15 @@ static ERL_NIF_TERM nif_open_output(ErlNifEnv *env, int argc,
   // Output is a shared port; sending targets a destination by uid. Opening
   // checks the destination exists and marks it sendable.
   if (!ensure_client()) {
-    midi_send_error(&pid, (SInt32)uid, "open_output", "no_client");
+    midi_send_error(env, &pid, (SInt32)uid, "open_output", "no_client");
     return enif_make_atom(env, "ok");
   }
   if (dest_for_uid((SInt32)uid) == 0) {
-    midi_send_error(&pid, (SInt32)uid, "open_output", "no_such_device");
+    midi_send_error(env, &pid, (SInt32)uid, "open_output", "no_such_device");
     return enif_make_atom(env, "ok");
   }
   set_output_open((SInt32)uid, YES);
-  midi_send_opened(&pid, (SInt32)uid);
+  midi_send_opened(env, &pid, (SInt32)uid);
   return enif_make_atom(env, "ok");
 }
 
@@ -317,11 +321,18 @@ static ERL_NIF_TERM nif_send(ErlNifEnv *env, int argc,
     return enif_make_tuple2(env, enif_make_atom(env, "error"),
                             enif_make_atom(env, "no_such_device"));
 
+  // One MIDIPacket carries at most 256 bytes here; refuse rather than
+  // truncate (a cut-off SysEx is worse than an error).
+  if (bin.size > 256)
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "too_large"));
   Byte buffer[512];
   MIDIPacketList *pktlist = (MIDIPacketList *)buffer;
   MIDIPacket *pkt = MIDIPacketListInit(pktlist);
-  size_t len = bin.size > 256 ? 256 : bin.size;
-  MIDIPacketListAdd(pktlist, sizeof(buffer), pkt, 0, len, bin.data);
+  pkt = MIDIPacketListAdd(pktlist, sizeof(buffer), pkt, 0, bin.size, bin.data);
+  if (pkt == NULL)
+    return enif_make_tuple2(env, enif_make_atom(env, "error"),
+                            enif_make_atom(env, "send_failed"));
   if (MIDISend(g_out_port, dest, pktlist) != noErr)
     return enif_make_tuple2(env, enif_make_atom(env, "error"),
                             enif_make_atom(env, "send_failed"));

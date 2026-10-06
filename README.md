@@ -30,9 +30,11 @@ end
 Waiting for `:opened` is optional: Android opens the port asynchronously and
 queues sends made before it opens (up to 256 per device), writing them in order
 the moment it does. If the open fails, the queue is discarded and the error's
-`dropped` counts the lost messages. `send_*` return `socket` when the message was
-written or queued and `{:error, reason}` when it wasn't (`:not_open`,
-`:queue_full`, `:no_such_device`, `:send_failed`).
+`dropped` counts the lost messages (`close/2` during the open reports `reason:
+:closed` the same way). `send_*` return `socket` when the message was written or
+queued and `{:error, reason}` when it wasn't (`:not_open`, `:queue_full`,
+`:no_such_device`, `:too_large` for iOS sends over 256 bytes, `:send_failed`), so
+bind the result instead of piping it on as the socket.
 
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.

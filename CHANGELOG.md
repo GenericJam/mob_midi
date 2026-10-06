@@ -14,16 +14,21 @@ Operator v1 release review fixes (MOB-397).
 - **`open_output/2` replies to its caller**: `{:midi, :opened, %{device: id,
   direction: :output}}` once the port is ready, or `{:midi, :error, %{device:
   id, op: :open_output, reason: atom, dropped: n}}` when it can't be opened
-  (`:no_such_device`, `:open_failed`, `:no_input_port`, ...). Same on iOS.
+  (`:no_such_device`, `:open_failed`, `:no_input_port`, `:closed` when
+  `close/2` cancels an open in flight). Same on iOS.
 - **Android queues sends made while an output is still opening** (up to 256
   per device) and writes them in order once it opens. Before, the device opened
   asynchronously and those sends were silently dropped, so the first notes
   after `open_output/2` vanished. If the open fails the queue is discarded and
   the error event's `dropped` counts the lost messages.
-- **`send_*` return `{:error, reason}` when nothing was written or queued**:
+- **Breaking: `send_*` return `{:error, reason}` when nothing was written or
+  queued**, where 0.1.1 returned `socket` and silently dropped the message:
   `:not_open` (no `open_output/2`, closed, or failed to open), `:queue_full`,
-  `:no_such_device` (iOS) or `:send_failed`. They still return `socket` on
-  success. iOS now requires `open_output/2` before sending, as Android did.
+  `:no_such_device` (iOS), `:too_large` (iOS, over 256 bytes; 0.1.1 truncated)
+  or `:send_failed`. They still return `socket` on success. Code that pipes a
+  `send_*` result on as the socket must bind it instead.
+- **Breaking (iOS): `open_output/2` is required before sending**, as it already
+  was on Android; 0.1.1's iOS NIF sent to any destination.
 - iOS `{:midi, :error, ...}` events from `open_input/2` carry `device`, `op`
   and `dropped` alongside `reason`.
 - Android names devices that lack `PROPERTY_NAME` (virtual
@@ -38,6 +43,9 @@ Operator v1 release review fixes (MOB-397).
   hardware unverified. Replaces the "first pass, not device-verified" wording.
 - Demo screen routes corrected to `/midi_keyboard` and `/midi_input`.
 - The send example waits for `:opened`.
+- README notes that a host activating both mob_midi and mob_bluetooth must set
+  `NSBluetoothAlwaysUsageDescription` in its own `ios/Info.plist` (both plugins
+  declare it; mob_dev 0.7.14 refuses the build otherwise).
 
 ## [0.1.1] - 2026-09-30
 

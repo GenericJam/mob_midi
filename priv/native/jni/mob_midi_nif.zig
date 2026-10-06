@@ -73,6 +73,21 @@ fn makeBinary(env: ?*erts.ErlNifEnv, data: []const u8) erts.ERL_NIF_TERM {
     return erts.enif_make_binary(env, &bin);
 }
 
+// Never leave a pending Java exception on a BEAM scheduler thread: the next
+// JNI call would be undefined (CheckJNI aborts). Returns true, after clearing
+// it, when one was pending. mob_zig types ExceptionOccurred as opaque (and
+// omits ExceptionCheck), so give it its JNI signature here; align(1) because a
+// Thumb function pointer has bit 0 set.
+fn clearPendingException(jenv: *jni.JNIEnv) bool {
+    const exception_occurred: *align(1) const fn (*jni.JNIEnv) callconv(.c) jni.JObject =
+        @ptrCast(jenv.*.ExceptionOccurred.?);
+    const thrown = exception_occurred(jenv);
+    if (thrown == null) return false;
+    jni.exceptionClear(jenv);
+    jni.deleteLocalRef(jenv, thrown);
+    return true;
+}
+
 // ── NIFs ─────────────────────────────────────────────────────────────────
 
 fn callSelfVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID) erts.ERL_NIF_TERM {
@@ -83,6 +98,7 @@ fn callSelfVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID) erts.ERL_NIF_TERM {
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
     defer detachIfAttached(attached);
     jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid));
+    if (clearPendingException(jenv)) return erts.atom(env, "error");
     return erts.ok(env);
 }
 
@@ -103,6 +119,7 @@ fn callSelfDeviceVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, argv: [*]const 
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
     defer detachIfAttached(attached);
     jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), @as(jni.JInt, dev));
+    if (clearPendingException(jenv)) return erts.atom(env, "error");
     return erts.ok(env);
 }
 
@@ -119,6 +136,7 @@ fn callDeviceVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, argv: [*]const erts
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
     defer detachIfAttached(attached);
     jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, @as(jni.JInt, dev));
+    if (clearPendingException(jenv)) return erts.atom(env, "error");
     return erts.ok(env);
 }
 
@@ -146,21 +164,15 @@ export fn nif_midi_send(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.
     defer detachIfAttached(attached);
 
     const jarr = jenv.*.NewByteArray.?(jenv, @intCast(bin.size));
-    if (jarr == null) return erts.atom(env, "error");
+    if (jarr == null) {
+        _ = clearPendingException(jenv); // OutOfMemoryError
+        return erts.errorTuple(env, erts.atom(env, "send_failed"));
+    }
     jenv.*.SetByteArrayRegion.?(jenv, jarr, 0, @intCast(bin.size), @ptrCast(bin.data));
     const code = jenv.*.CallStaticIntMethod.?(jenv, g_midi_cls, g_midi.send, @as(jni.JInt, dev), jarr);
     jenv.*.DeleteLocalRef.?(jenv, jarr);
-    // Never leave a pending Java exception on this (BEAM scheduler) thread.
-    // mob_zig types ExceptionOccurred as opaque (and omits ExceptionCheck), so
-    // give it its JNI signature here.
-    const exception_occurred: *const fn (*jni.JNIEnv) callconv(.c) jni.JObject =
-        @ptrCast(@alignCast(jenv.*.ExceptionOccurred.?));
-    const thrown = exception_occurred(jenv);
-    if (thrown != null) {
-        jni.exceptionClear(jenv);
-        jni.deleteLocalRef(jenv, thrown);
-        return erts.errorTuple(env, erts.atom(env, "send_failed"));
-    }
+    // A throw leaves `code` meaningless; check before trusting it.
+    if (clearPendingException(jenv)) return erts.errorTuple(env, erts.atom(env, "send_failed"));
     // Codes mirror MobMidiBridge.SEND_*.
     return switch (code) {
         0 => erts.ok(env),

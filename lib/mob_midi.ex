@@ -73,7 +73,9 @@ defmodule MobMidi do
   `send_*` return `socket` when the message was written or queued, and
   `{:error, reason}` when it wasn't: `:not_open` (no `open_output/2` for that
   device, or it was closed or failed to open), `:queue_full`, `:no_such_device`
-  (iOS: the destination disappeared) or `:send_failed`.
+  (iOS: the destination disappeared), `:too_large` (iOS: over 256 bytes in one
+  send) or `:send_failed`; `{:error, :unsupported}` on the host. So bind the
+  result rather than piping it on as the socket.
 
   Channels are `0..15` on the wire (shown as 1..16 in most UIs). Notes /
   velocities / values are `0..127`.
@@ -91,7 +93,8 @@ defmodule MobMidi do
 
   import Bitwise
 
-  @type device_id :: non_neg_integer()
+  # Android: MidiDeviceInfo id; iOS: CoreMIDI endpoint unique id (an SInt32, can be negative).
+  @type device_id :: integer()
   @type channel :: 0..15
   @type byte7 :: 0..127
 
@@ -118,8 +121,9 @@ defmodule MobMidi do
   The calling process receives `{:midi, :opened, %{device: id, direction:
   :output}}` when the port is ready, or `{:midi, :error, %{device: id, op:
   :open_output, reason: reason, dropped: n}}` when it can't be opened (reasons
-  include `:no_such_device`, `:open_failed`, `:no_input_port`). Sends made
-  before `:opened` are queued and flushed in order; see "Sending" above.
+  include `:no_such_device`, `:open_failed`, `:no_input_port`, and `:closed`
+  when `close/2` cancels an open still in flight). Sends made before `:opened`
+  are queued and flushed in order; see "Sending" above.
   """
   @spec open_output(term(), device_id()) :: term()
   def open_output(socket, device_id) when is_integer(device_id) do
