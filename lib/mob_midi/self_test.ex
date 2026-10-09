@@ -104,7 +104,7 @@ defmodule MobMidi.SelfTest do
     after
       timeout ->
         {:fail,
-         "midi_list_devices/0 returned :ok but delivered no {:midi, :devices, _} " <>
+         "midi_list_devices/0 returned :ok but delivered no device list or list_devices error " <>
            "within #{timeout} ms"}
     end
   end
