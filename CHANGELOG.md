@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-10-09
 
 ### Added
 - **On-device self-test** (MOB-418). `MobMidi.SelfTest` implements
@@ -15,16 +15,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
   devices listed pass; an empty list, or an Android device without a MIDI
   service, is `{:skip, :needs_hardware}`; an unregistered Android bridge, a
   missing Activity, a failed CoreMIDI client, a malformed list or no answer
-  fail. Run it with `mix mob.selftest` from a host app (mob_dev 0.7.17).
-  Requires mob 0.9.15; `mob_version` in the manifest is now `~> 0.9`.
+  fail. Run it with `mix mob.selftest` from a host app (mob_dev 0.7.17+).
 
 ### Changed
-- **`list_devices/1` reports why it couldn't list.** Android delivered an
-  empty list when the bridge had no Activity or the device has no
-  `MidiManager`, and iOS delivered nothing when `MIDIClientCreate` failed.
-  Both now deliver `{:midi, :error, %{device: 0, op: :list_devices, reason:
-  :no_activity | :no_midi_service | :no_client, dropped: 0}}`, so "no
-  devices" is no longer confused with "couldn't ask".
+- **Requires mob >= 0.9.15** (for `Mob.Plugin.SelfTest`): the `:mob`
+  dependency is now `~> 0.9 and >= 0.9.15` (was `~> 0.7`) and the manifest's
+  `mob_version` is `~> 0.9` (was `~> 0.7`).
+- **Behaviour change: `list_devices/1` reports why it couldn't list.**
+  Android delivered an empty list when the bridge had no Activity or the
+  device has no `MidiManager`, and iOS delivered nothing when
+  `MIDIClientCreate` failed. Both now deliver `{:midi, :error, %{device: 0,
+  op: :list_devices, reason: :no_activity | :no_midi_service | :no_client,
+  dropped: 0}}`, so "no devices" is no longer confused with "couldn't ask".
+  Screens that call `list_devices/1` must now handle this message.
+
+### Fixed
+- iOS: `list_devices/1` always answers its own caller, even when a
+  concurrent `list_devices/1` call from another process is in flight.
 
 ## [0.1.2] - 2026-10-05
 
