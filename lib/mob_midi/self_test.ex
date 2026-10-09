@@ -29,7 +29,9 @@ defmodule MobMidi.SelfTest do
       simulator: that is still a real enumeration from CoreMIDI, so it passes.
     * `{:midi, :devices, []}` (or `"[]"`) — `{:skip, :needs_hardware}`: the
       native stack answered, so the NIF and bridge are proven, but there is
-      no MIDI device attached to exercise.
+      no MIDI device attached to exercise. (`Mob.Plugin.SelfTest` would also
+      allow `:pass` here; this plugin reports a skip so a CI cell shows that
+      MIDI I/O itself went unexercised. Init is proven either way.)
     * `{:midi, :error, %{op: :list_devices, reason: :no_midi_service}}` —
       `{:skip, :needs_hardware}`: Android delivered it through the bridge
       (proving it), but the device has no `MidiManager` (no
@@ -44,7 +46,9 @@ defmodule MobMidi.SelfTest do
   State: on iOS `midi_list_devices/0` makes the caller the hot-plug
   subscriber (`{:midi, :device_added | :device_removed, nil}`, last caller
   wins), as `MobMidi.list_devices/1` does; the next `list_devices` from a
-  screen takes it back. Nothing is opened, sent or written.
+  screen takes it back. Nothing is opened, sent or written. Stale list
+  answers already in the caller's mailbox are flushed before the call, so
+  only this call's answer is classified.
   """
   @behaviour Mob.Plugin.SelfTest
 
@@ -52,10 +56,21 @@ defmodule MobMidi.SelfTest do
 
   @impl true
   def run(_ctx) do
+    flush_answers()
     classify(:mob_midi_nif.midi_list_devices(), @answer_timeout)
-  rescue
-    e in ErlangError ->
-      {:fail, "mob_midi_nif is not linked into this build: #{Exception.message(e)}"}
+  catch
+    :error, :nif_not_loaded ->
+      {:fail,
+       "mob_midi_nif is not linked into this build: midi_list_devices/0 raised nif_not_loaded"}
+  end
+
+  defp flush_answers do
+    receive do
+      {:midi, :devices, _} -> flush_answers()
+      {:midi, :error, %{op: :list_devices}} -> flush_answers()
+    after
+      0 -> :ok
+    end
   end
 
   @doc false

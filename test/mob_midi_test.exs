@@ -204,6 +204,17 @@ defmodule MobMidiTest do
       assert Mob.Plugin.SelfTest.result?(result)
     end
 
+    test "flushes stale list answers before calling, keeping unrelated MIDI traffic" do
+      send(self(), {:midi, :devices, [%{id: 1, name: "stale", direction: :input}]})
+      send(self(), {:midi, :error, %{device: 0, op: :list_devices, reason: :no_activity}})
+      send(self(), {:midi, :raw, %{device: 1, bytes: <<0x90, 60, 100>>}})
+
+      assert {:fail, _} = SelfTest.run(%{platform: :ios, device: :simulator})
+      refute_received {:midi, :devices, _}
+      refute_received {:midi, :error, _}
+      assert_received {:midi, :raw, _}
+    end
+
     test "an unregistered Android bridge or a JNI failure fails without waiting for an answer" do
       send(self(), {:midi, :devices, []})
 
