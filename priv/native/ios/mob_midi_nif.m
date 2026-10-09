@@ -204,10 +204,18 @@ static ERL_NIF_TERM nif_list_devices(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]) {
   (void)argc;
   (void)argv;
-  enif_self(env, &g_list_pid);
+  // Answer THIS caller (a concurrent list_devices may overwrite g_list_pid,
+  // the hot-plug subscriber, before we send).
+  ErlNifPid self;
+  enif_self(env, &self);
+  g_list_pid = self;
   g_have_list_pid = YES;
-  if (!ensure_client())
+  // No CoreMIDI client: say so instead of answering nothing, so the caller
+  // (and MobMidi.SelfTest) can tell it from an empty device list.
+  if (!ensure_client()) {
+    midi_send_error(env, &self, 0, "list_devices", "no_client");
     return enif_make_atom(env, "ok");
+  }
 
   ErlNifEnv *e = enif_alloc_env();
   ERL_NIF_TERM list = enif_make_list(e, 0);
@@ -242,7 +250,7 @@ static ERL_NIF_TERM nif_list_devices(ErlNifEnv *env, int argc,
     }
   }
 
-  enif_send(NULL, &g_list_pid, e, midi_env3(e, "devices", list));
+  enif_send(env, &self, e, midi_env3(e, "devices", list));
   enif_free_env(e);
   return enif_make_atom(env, "ok");
 }

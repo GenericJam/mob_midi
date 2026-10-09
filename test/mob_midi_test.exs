@@ -2,6 +2,7 @@ defmodule MobMidiTest do
   use ExUnit.Case, async: true
 
   alias MobDev.Plugin.{Manifest, Validator}
+  alias MobMidi.SelfTest
 
   @plugin_dir Path.expand("..", __DIR__)
 
@@ -153,7 +154,14 @@ defmodule MobMidiTest do
   describe "manifest" do
     test "loads + validates clean as a tier-3 plugin (screens + per-platform NIFs)" do
       {:ok, manifest} = Manifest.load(@plugin_dir)
-      assert %{errors: []} = Validator.validate_plugin(manifest, @plugin_dir, "0.7.5")
+      assert %{errors: []} = Validator.validate_plugin(manifest, @plugin_dir, "0.9.15")
+    end
+
+    test "declares the self-test, which passes the validator without a selftest warning" do
+      {:ok, manifest} = Manifest.load(@plugin_dir)
+      assert manifest.selftest == MobMidi.SelfTest
+      assert %{errors: [], warnings: warnings} = Validator.validate_plugin(manifest, @plugin_dir)
+      refute Enum.any?(warnings, &(&1 =~ "selftest"))
     end
 
     # credo:disable-for-next-line Jump.CredoChecks.VacuousTest
@@ -178,6 +186,89 @@ defmodule MobMidiTest do
       kt = File.read!(Path.join(@plugin_dir, "priv/native/android/MobMidiBridge.kt"))
       assert kt =~ "android.media.midi.MidiManager"
       assert kt =~ "MidiReceiver"
+    end
+  end
+
+  describe "MobMidi.SelfTest" do
+    defp answer(msg) do
+      send(self(), msg)
+      result = SelfTest.classify(:ok, 0)
+      assert Mob.Plugin.SelfTest.result?(result)
+      result
+    end
+
+    test "on a host with no native library linked it fails, naming the NIF, instead of raising" do
+      assert {:fail, reason} = result = SelfTest.run(%{platform: :android, device: :emulator})
+      assert reason =~ "mob_midi_nif is not linked"
+      assert reason =~ "nif_not_loaded"
+      assert Mob.Plugin.SelfTest.result?(result)
+    end
+
+    test "flushes stale list answers before calling, keeping unrelated MIDI traffic" do
+      send(self(), {:midi, :devices, [%{id: 1, name: "stale", direction: :input}]})
+      send(self(), {:midi, :error, %{device: 0, op: :list_devices, reason: :no_activity}})
+      send(self(), {:midi, :raw, %{device: 1, bytes: <<0x90, 60, 100>>}})
+
+      assert {:fail, _} = SelfTest.run(%{platform: :ios, device: :simulator})
+      refute_received {:midi, :devices, _}
+      refute_received {:midi, :error, _}
+      assert_received {:midi, :raw, _}
+    end
+
+    test "an unregistered Android bridge or a JNI failure fails without waiting for an answer" do
+      send(self(), {:midi, :devices, []})
+
+      for {ret, prefix} <- [
+            {{:error, :nif_not_loaded}, "midi_list_devices/0 returned {:error, :nif_not_loaded}"},
+            {:error, "midi_list_devices/0 returned :error"},
+            {:queued, "midi_list_devices/0 returned :queued, expected :ok"}
+          ] do
+        assert {:fail, reason} = result = SelfTest.classify(ret, 0)
+        assert String.starts_with?(reason, prefix)
+        assert Mob.Plugin.SelfTest.result?(result)
+      end
+    end
+
+    test "a non-empty device list passes, from iOS (maps) or Android (JSON)" do
+      assert answer({:midi, :devices, [%{id: -12_345, name: "Network", direction: :input}]}) ==
+               :pass
+
+      assert answer({:midi, :devices, ~s([{"id":3,"name":"Oxygen 49","direction":"both"}])}) ==
+               :pass
+    end
+
+    test "an empty device list is a hardware skip on both platforms" do
+      assert answer({:midi, :devices, []}) == {:skip, :needs_hardware}
+      assert answer({:midi, :devices, "[]"}) == {:skip, :needs_hardware}
+    end
+
+    test "list_devices errors: no MIDI service skips, a missing Activity or client fails" do
+      err = &{:midi, :error, %{device: 0, op: :list_devices, reason: &1, dropped: 0}}
+
+      assert answer(err.(:no_midi_service)) == {:skip, :needs_hardware}
+      assert {:fail, "MobMidiBridge has no Activity" <> _} = answer(err.(:no_activity))
+      assert {:fail, "CoreMIDI MIDIClientCreate failed" <> _} = answer(err.(:no_client))
+      assert {:fail, "midi_list_devices/0 delivered error :bogus"} = answer(err.(:bogus))
+    end
+
+    test "a malformed device list fails instead of passing or skipping" do
+      assert {:fail, "midi_list_devices/0 delivered \"not json\"" <> _} =
+               answer({:midi, :devices, "not json"})
+
+      assert {:fail, "midi_list_devices/0 delivered %{}" <> _} = answer({:midi, :devices, %{}})
+
+      assert {:fail, "midi_list_devices/0 delivered malformed devices" <> _} =
+               answer({:midi, :devices, [%{name: "no id"}]})
+    end
+
+    test "ignores other MIDI traffic and fails when no list arrives" do
+      send(self(), {:midi, :device_added, nil})
+      send(self(), {:midi, :error, %{device: 7, op: :open_output, reason: :closed, dropped: 0}})
+
+      assert {:fail, "midi_list_devices/0 returned :ok but delivered no" <> _} =
+               result = SelfTest.classify(:ok, 0)
+
+      assert Mob.Plugin.SelfTest.result?(result)
     end
   end
 end
