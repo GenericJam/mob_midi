@@ -18,6 +18,12 @@ defmodule MobMidi do
       MobMidi.list_devices(socket)
       # => {:midi, :devices, [%{id: 1, name: "Oxygen 49", direction: :input}, ...]}
 
+  When the platform can't be asked, the caller gets `{:midi, :error, %{device:
+  0, op: :list_devices, reason: reason, dropped: 0}}` instead: `:no_activity`
+  (Android: the bridge never got its Activity), `:no_midi_service` (Android:
+  the device has no MIDI support) or `:no_client` (iOS: `MIDIClientCreate`
+  failed). An empty list means the platform answered and found no devices.
+
   Hot-plug: on iOS a device appearing / disappearing sends
   `{:midi, :device_added, nil}` / `{:midi, :device_removed, nil}` to the last
   `list_devices/1` caller; re-list on either. Android doesn't deliver hot-plug
@@ -101,7 +107,11 @@ defmodule MobMidi do
 
   # ── Public API ──────────────────────────────────────────────────────────
 
-  @doc "Enumerate available MIDI devices. Result: `{:midi, :devices, [device]}`."
+  @doc """
+  Enumerate available MIDI devices. Result: `{:midi, :devices, [device]}`, or
+  `{:midi, :error, %{op: :list_devices, ...}}` when the platform can't be asked
+  (see "Discovering devices" above).
+  """
   @spec list_devices(term()) :: term()
   def list_devices(socket) do
     guarded(socket, fn -> :mob_midi_nif.midi_list_devices() end)

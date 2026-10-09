@@ -206,8 +206,12 @@ static ERL_NIF_TERM nif_list_devices(ErlNifEnv *env, int argc,
   (void)argv;
   enif_self(env, &g_list_pid);
   g_have_list_pid = YES;
-  if (!ensure_client())
+  // No CoreMIDI client: say so instead of answering nothing, so the caller
+  // (and MobMidi.SelfTest) can tell it from an empty device list.
+  if (!ensure_client()) {
+    midi_send_error(env, &g_list_pid, 0, "list_devices", "no_client");
     return enif_make_atom(env, "ok");
+  }
 
   ErlNifEnv *e = enif_alloc_env();
   ERL_NIF_TERM list = enif_make_list(e, 0);

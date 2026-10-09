@@ -6,6 +6,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Added
+- **On-device self-test** (MOB-418). `MobMidi.SelfTest` implements
+  `Mob.Plugin.SelfTest` and is declared in the manifest as `selftest:`. It
+  calls `midi_list_devices/0` (read-only) and classifies the native answer:
+  devices listed pass; an empty list, or an Android device without a MIDI
+  service, is `{:skip, :needs_hardware}`; an unregistered Android bridge, a
+  missing Activity, a failed CoreMIDI client, a malformed list or no answer
+  fail. Run it with `mix mob.selftest` from a host app (mob_dev 0.7.17).
+  Requires mob 0.9.15; `mob_version` in the manifest is now `~> 0.9`.
+
+### Changed
+- **`list_devices/1` reports why it couldn't list.** Android delivered an
+  empty list when the bridge had no Activity or the device has no
+  `MidiManager`, and iOS delivered nothing when `MIDIClientCreate` failed.
+  Both now deliver `{:midi, :error, %{device: 0, op: :list_devices, reason:
+  :no_activity | :no_midi_service | :no_client, dropped: 0}}`, so "no
+  devices" is no longer confused with "couldn't ask".
+
 ## [0.1.2] - 2026-10-05
 
 Operator v1 release review fixes (MOB-397).

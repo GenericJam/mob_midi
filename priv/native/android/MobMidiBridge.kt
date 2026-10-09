@@ -117,10 +117,19 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware {
         }, main)
     }
 
+    // An empty list means MidiManager answered with no devices. When there is
+    // no MidiManager to ask, the caller gets {:midi, :error, %{op:
+    // :list_devices, reason: :no_activity | :no_midi_service}} instead, so
+    // "no devices" is never confused with "never asked" (MobMidi.SelfTest
+    // relies on this).
     @JvmStatic
     fun listDevices(pid: Long) {
-        val mm = midiManager() ?: run {
-            nativeDeliverMidiDevices(pid, "[]"); return
+        val activity = activityRef?.get() ?: run {
+            nativeDeliverMidiError(pid, 0, "list_devices", "no_activity", 0); return
+        }
+        // null when the device lacks PackageManager.FEATURE_MIDI.
+        val mm = activity.getSystemService(Context.MIDI_SERVICE) as? MidiManager ?: run {
+            nativeDeliverMidiError(pid, 0, "list_devices", "no_midi_service", 0); return
         }
         val arr = JSONArray()
         for (info in mm.devices) {

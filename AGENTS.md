@@ -19,6 +19,7 @@ Cross-platform MIDI: enumerate devices, hot-plug notifications, subscribe to inp
 ## Anatomy of the plugin
 
 * `lib/mob_midi.ex` — public API + pure `parse/1`.
+* `lib/mob_midi/self_test.ex` — `MobMidi.SelfTest` (`Mob.Plugin.SelfTest`, manifest `selftest:`): `midi_list_devices/0` round trip; `classify/2` maps the NIF return + delivered answer to pass / skip / fail and is what the unit tests drive.
 * `src/mob_midi_nif.erl` — Erlang NIF stub.
 * `priv/mob_plugin.exs` — plugin manifest. iOS `CoreMIDI` framework; Android runtime permissions per platform.
 * `priv/native/ios/mob_midi_nif.m` — iOS NIF (ObjC): CoreMIDI client, source subscribing, `MIDIPacketList` send.
@@ -49,6 +50,7 @@ Native paths are **experimental** (README "Status"). No hardware needed for the 
 4. **Channel numbering:** `0..15` on the wire; most UIs show `1..16`. Do not silently offset — that's a UX decision the app makes.
 5. **Hot-plug is asynchronous and iOS-only.** iOS sends `{:midi, :device_added | :device_removed, nil}` to the last `list_devices` caller; Android doesn't deliver hot-plug events yet. A `list_devices` snapshot goes stale the moment it's returned.
 6. **`open_output/2` replies; `send_*` can fail.** The caller gets `{:midi, :opened, ...}` or `{:midi, :error, %{op: :open_output, ...}}`. Android opens asynchronously and queues up to 256 sends per device until then (`MobMidiBridge.MAX_PENDING_SENDS`); the NIF answers `:ok | :queued | {:error, reason}` and `MobMidi.send_result/2` maps that. Keep the Kotlin `SEND_*` codes and the zig switch in `nif_midi_send` in step.
+7. **`list_devices` never answers "no devices" when it couldn't ask.** No Activity / no `MidiManager` (Android) and a failed `MIDIClientCreate` (iOS) deliver `{:midi, :error, %{op: :list_devices, reason: :no_activity | :no_midi_service | :no_client}}`; an empty list means the platform answered. `MobMidi.SelfTest` depends on that distinction, so keep it when touching `listDevices` / `nif_list_devices`.
 
 ## Pre-commit + release
 

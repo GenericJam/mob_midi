@@ -1,8 +1,11 @@
 %{
   name: :mob_midi,
-  mob_version: "~> 0.7",
+  mob_version: "~> 0.9",
   plugin_spec_version: 1,
   description: "MIDI in + out (USB / BLE) — CoreMIDI on iOS, android.media.midi on Android",
+  # On-device proof for `mix mob.selftest` / mob_ci: a read-only
+  # midi_list_devices/0 round trip through the NIF (see Mob.Plugin.SelfTest).
+  selftest: MobMidi.SelfTest,
   nifs: [
     # Android: zig NIF bridging to the Kotlin MobMidiBridge (android.media.midi).
     # platform: :android so the iOS build skips it.

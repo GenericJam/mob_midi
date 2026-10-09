@@ -37,13 +37,13 @@ defmodule MobMidi.MixProject do
       {:ex_ast, "~> 0.12", only: [:dev, :test], runtime: false},
       {:reach, "~> 2.7", only: [:dev, :test], runtime: false},
       {:recon, "~> 2.5", only: [:dev, :test]},
-      {:mob, "~> 0.7"},
+      {:mob, "~> 0.9 and >= 0.9.15"},
       # BLE-MIDI (MobMidi.Ble) advertises the phone as a peripheral via
       # MobBluetooth.Le — the GATT-peripheral primitive added in mob_bluetooth
       # 0.3. USB-MIDI needs none of this; it's a compile-time dep only because
       # the BLE transport module references it.
       {:mob_bluetooth, "~> 0.3"},
-      {:mob_dev, "~> 0.6", only: [:dev, :test], runtime: false},
+      {:mob_dev, "~> 0.7.17", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_slop, "~> 0.4.2", only: [:dev, :test], runtime: false},

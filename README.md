@@ -39,6 +39,11 @@ bind the result instead of piping it on as the socket.
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.
 
+On-device self-test: `MobMidi.SelfTest` (declared as `selftest:` in the
+manifest) lists MIDI devices through the NIF; run it from a host app with
+`mix mob.selftest` (mob_dev 0.7.17+). No attached MIDI device is a
+`:needs_hardware` skip.
+
 ## Demo screens (tier 3)
 
 Two screens the host auto-lists via `Mob.Plugins.screens()`:
