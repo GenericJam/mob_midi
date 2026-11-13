@@ -28,7 +28,7 @@ end
 ```
 
 Waiting for `:opened` is optional: Android opens the port asynchronously and
-queues sends made before it opens (up to 256 per device), writing them in order
+queues sends made before it opens (up to 256 64-byte chunks per port), writing them in order
 the moment it does. If the open fails, the queue is discarded and the error's
 `dropped` counts the lost messages (`close/2` during the open reports `reason:
 :closed` the same way). `send_*` return `socket` when the message was written or

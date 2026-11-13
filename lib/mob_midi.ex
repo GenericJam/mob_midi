@@ -83,7 +83,8 @@ defmodule MobMidi do
         do: {:noreply, Mob.Socket.assign(socket, :midi_error, reason)}
 
   You don't have to wait for `:opened`: Android opens the port asynchronously,
-  and sends made before it opens are queued (up to 256 messages per port)
+  and sends made before it opens are queued (up to 256 64-byte chunks per port:
+  256 short messages, fewer long ones)
   and written in order the moment it does. If the open fails, the queue is
   discarded and the error event's `dropped` says how many messages were lost.
   iOS opens synchronously, so the event arrives before `open_output/2` returns.

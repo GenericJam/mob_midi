@@ -74,7 +74,7 @@ caller's job (Magpie keeps its frame→`CLOCK_MONOTONIC` mapping).
   `android.jni_source`, linked into the same app library as every static NIF,
   so another NIF (Magpie's `magpie_audio`) calls it directly.
 - **Receive**: each opened input port is a source (1..63) with a generation
-  from a global counter (never repeats). Kotlin's `MidiReceiver` passes the
+  from a global 31-bit counter (repeats only after 2^31 opens). Kotlin's `MidiReceiver` passes the
   generation it was opened with; C delivers only the current one, under the
   source's lock, so once close returns nothing of the old port arrives. A
   sink `(ctx, source, generation, bytes, len, timestamp_ns)` registered with

@@ -24,7 +24,7 @@
  * opened by MobMidi.open_virtual/3) is a SOURCE: a small integer in
  * 1..MOB_MIDI_MAX_SOURCES-1, reused after the port closes. Each time a source
  * is taken, given back, or (virtual device) another app starts or stops
- * sending into it, its GENERATION changes (it never repeats). Bytes are
+ * sending into it, its GENERATION changes (a 31-bit counter: it repeats only after 2^31 opens). Bytes are
  * delivered only for the current generation: once close returns, nothing of
  * the old port's stream reaches you, even a message its thread was already
  * delivering (on the app's own virtual input ports the generation changes
@@ -54,8 +54,9 @@
  * output port of the app's own virtual device after MobMidi.open_virtual/3)
  * has a handle: MobMidi.output_handle/2 returns it, and the {:midi, :opened,
  * ...} event of an output carries it as `handle`. Pass it to your NIF.
- * Handles are never reused: a closed port's handle answers
- * MOB_MIDI_ERR_NOT_OPEN, even after the same device/port is opened again.
+ * Handles carry the same counter: a closed port's handle answers
+ * MOB_MIDI_ERR_NOT_OPEN, even after the same device/port is opened again
+ * (until the counter wraps after 2^31 opens).
  *
  * mob_midi_send copies the bytes into the port's queue (no allocation) and
  * returns. A per-port dispatch thread hands them to Android at `at_ns`
