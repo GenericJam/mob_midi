@@ -1,6 +1,6 @@
 # mob_midi — Agent Instructions
 
-You're in **mob_midi**, a Mob capability plugin: MIDI in + out over USB-MIDI and BLE-MIDI on both iOS (CoreMIDI) and Android (`android.media.midi`). Public API is `MobMidi.{list_devices, open_input, open_output, send_note_on, send_note_off, send_cc, send_raw, parse}/*`.
+You're in **mob_midi**, a Mob capability plugin: MIDI in + out over USB-MIDI and BLE-MIDI on both iOS (CoreMIDI) and Android (`android.media.midi`). Public API is `MobMidi.{list_devices, open_input, open_output, open_virtual, close, send_note_on, send_note_off, send_cc, send_raw, now_ns, scan_bluetooth, stop_bluetooth_scan, connect_bluetooth, parse, parse_devices}/*`.
 
 **Also read [`~/code/mob/AGENTS.md`](../mob/AGENTS.md)** for the system view and the cross-cutting pre-empt-failure rules, and [`~/code/mob/MOB_PLUGINS.md`](../mob/MOB_PLUGINS.md) for the manifest schema. This file is mob_midi-specific.
 
@@ -24,7 +24,7 @@ Cross-platform MIDI: enumerate devices, hot-plug notifications, subscribe to inp
 * `priv/mob_plugin.exs` — plugin manifest. iOS `CoreMIDI` framework; Android runtime permissions per platform.
 * `priv/native/ios/mob_midi_nif.m` — iOS NIF (ObjC): CoreMIDI client, source subscribing, `MIDIPacketList` send.
 * `priv/native/jni/mob_midi_nif.zig` — Android NIF glue.
-* `priv/native/android/MobMidiBridge.kt` — Kotlin bridge: `android.media.midi.MidiManager` device enumeration, input port opening, output writes.
+* `priv/native/android/MobMidiBridge.kt` — Kotlin bridge: `android.media.midi.MidiManager` device enumeration + hot-plug callback, input/output ports by number, timestamped writes, BLE-MIDI scan + `openBluetoothDevice`, the `:midi_bluetooth` permission (`MobPermissionProvider`), and `MobMidiDeviceService`, the class host apps declare for their own virtual devices.
 
 ## Testing
 
@@ -48,8 +48,10 @@ Native paths are **experimental** (README "Status"). No hardware needed for the 
 2. **Note on with velocity 0 is note off** by MIDI convention. `parse/1` normalises this; if you're implementing new MIDI decoding paths, keep that normalisation — otherwise sustained-note bugs will chase you forever.
 3. **`send_raw/3` accepts binaries** — used for SysEx, MTC, or any status the typed helpers don't cover. Do NOT hand-craft note messages via `send_raw`; the typed helpers exist for a reason (clipping channel to 0..15, byte7 args to 0..127).
 4. **Channel numbering:** `0..15` on the wire; most UIs show `1..16`. Do not silently offset — that's a UX decision the app makes.
-5. **Hot-plug is asynchronous and iOS-only.** iOS sends `{:midi, :device_added | :device_removed, nil}` to the last `list_devices` caller; Android doesn't deliver hot-plug events yet. A `list_devices` snapshot goes stale the moment it's returned.
+5. **Hot-plug is asynchronous.** Both platforms send `{:midi, :device_added | :device_removed, nil}` to the last `list_devices` caller (Android from `MidiManager.DeviceCallback`, registered in `setActivity`; a removed device's ports are closed). A `list_devices` snapshot goes stale the moment it's returned.
 6. **`open_output/2` replies; `send_*` can fail.** The caller gets `{:midi, :opened, ...}` or `{:midi, :error, %{op: :open_output, ...}}`. Android opens asynchronously and queues up to 256 sends per device until then (`MobMidiBridge.MAX_PENDING_SENDS`); the NIF answers `:ok | :queued | {:error, reason}` and `MobMidi.send_result/2` maps that. Keep the Kotlin `SEND_*` codes and the zig switch in `nif_midi_send` in step.
+8. **Timestamps are one clock.** `now_ns/0`, the `timestamp` / `received` of `:raw` and `send_raw`'s `at:` are all `CLOCK_MONOTONIC` ns on Android (`System.nanoTime`) and `mach_absolute_time` ns on iOS. The `:raw` delivery is the latency-critical path (one JNI call that copies the bytes straight into the message binary): don't add hops or allocations there.
+9. **Virtual devices are declared by the host on Android.** Android reads a `MidiDeviceService`'s device name and ports from the app's manifest + `res/xml`, so the plugin ships only the class (`io.mob.midi.MobMidiDeviceService`); the README shows the declaration. `open_virtual/2` finds the device by name among the app's own (`MidiDeviceInfo.PROPERTY_SERVICE_INFO` package).
 7. **`list_devices` never answers "no devices" when it couldn't ask.** No Activity / no `MidiManager` (Android) and a failed `MIDIClientCreate` (iOS) deliver `{:midi, :error, %{op: :list_devices, reason: :no_activity | :no_midi_service | :no_client}}`; an empty list means the platform answered. `MobMidi.SelfTest` depends on that distinction, so keep it when touching `listDevices` / `nif_list_devices`.
 
 ## Pre-commit + release
