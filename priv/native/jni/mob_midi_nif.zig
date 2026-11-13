@@ -7,20 +7,23 @@
 //!
 //! Delivery contract (matches the iOS NIF):
 //!   {:midi, :devices, json_binary}                                   -- nativeDeliverMidiDevices
-//!   {:midi, :raw, %{device:, port:, bytes:, timestamp:, received:}}  -- nativeDeliverMidiRaw
-//!   {:midi, :opened, %{device:, port:, direction: :input | :output}} -- nativeDeliverMidiOpened
+//!   {:midi, :raw, %{device:, port:, bytes:, timestamp:, received:}}  -- mob_midi_core.c (nativeReceive)
+//!   {:midi, :opened, %{device:, port:, direction: :input, source:}}  -- nativeDeliverMidiOpened
+//!   {:midi, :opened, %{device:, port:, direction: :output, handle:}} -- nativeDeliverMidiOpened
 //!   {:midi, :opened, %{device:, direction: :virtual, name:}}         -- nativeDeliverMidiVirtualOpened
 //!   {:midi, :virtual_status, %{device:, senders:, listeners:}}       -- nativeDeliverMidiVirtualStatus
 //!   {:midi, :device_added | :device_removed, nil}                    -- nativeDeliverMidiEvent
 //!   {:midi, :bluetooth_scan, :started | :stopped}                    -- nativeDeliverMidiEvent
-//!   {:midi, :bluetooth_device, %{address:, name:}}                   -- nativeDeliverMidiBluetoothDevice
+//!   {:midi, :bluetooth_device, %{address:, name:, rssi:}}            -- nativeDeliverMidiBluetoothDevice
 //!   {:midi, :connected, %{device:, address:}}                        -- nativeDeliverMidiConnected
 //!   {:midi, :error, %{device:, op:, reason:, dropped:}}              -- nativeDeliverMidiError
 //!
-//! midi_send returns :ok (written), :queued (output still opening; flushed in
-//! order when it opens) or {:error, :not_open | :queue_full | :send_failed |
-//! :no_listener}. Timestamps are CLOCK_MONOTONIC ns (System.nanoTime), the
-//! clock of midi_now_ns/0.
+//! midi_send returns :ok (queued for the port's dispatch thread), :queued
+//! (output still opening; flushed in order when it opens) or {:error,
+//! :not_open | :queue_full | :send_failed | :no_listener}. An open output's
+//! bytes go straight into its queue in mob_midi_core.c (no JNI); only a port
+//! that isn't open yet takes the Kotlin path. Timestamps are CLOCK_MONOTONIC
+//! ns (System.nanoTime), the clock of midi_now_ns/0.
 //!
 //! mob-core ERTS / JNI bindings come in via the named imports @import("erts")
 //! and @import("jni") that build.zig wires for plugin NIFs.
@@ -30,6 +33,14 @@ const jni = @import("jni");
 
 extern fn get_jenv(attached: *c_int) ?*jni.JNIEnv;
 extern var g_jvm: ?*jni.JavaVM;
+
+// mob_midi_core.c (the plugin's android.jni_source): the send queues.
+extern fn mob_midi__send_device(device: i32, port: i32, bytes: [*]const u8, len: usize, at_ns: i64) c_int;
+extern fn mob_midi__output_handle(device: i32, port: i32) i64;
+const MOB_MIDI_OK: c_int = 0;
+const MOB_MIDI_ERR_NOT_OPEN: c_int = -1;
+const MOB_MIDI_ERR_QUEUE_FULL: c_int = -2;
+const MOB_MIDI_ERR_NO_LISTENER: c_int = -3;
 
 // enif_get_int64 is a macro for enif_get_long where long is 64-bit (as in
 // erl_nif.h), a real symbol elsewhere.
@@ -57,11 +68,11 @@ export fn Java_io_mob_midi_MobMidiBridge_nativeRegister(jenv: *jni.JNIEnv, cls: 
     g_midi_cls = jni.newGlobalRef(jenv, cls);
     if (g_midi_cls == null) return;
     g_midi.list_devices = jni.getStaticMethodID(jenv, cls, "listDevices", "(J)V");
-    g_midi.open_input = jni.getStaticMethodID(jenv, cls, "openInput", "(JII)V");
+    g_midi.open_input = jni.getStaticMethodID(jenv, cls, "openInput", "(JIII)V");
     g_midi.open_output = jni.getStaticMethodID(jenv, cls, "openOutput", "(JII)V");
     g_midi.send = jni.getStaticMethodID(jenv, cls, "send", "(II[BJ)I");
     g_midi.close = jni.getStaticMethodID(jenv, cls, "close", "(I)V");
-    g_midi.open_virtual = jni.getStaticMethodID(jenv, cls, "openVirtual", "(JLjava/lang/String;)V");
+    g_midi.open_virtual = jni.getStaticMethodID(jenv, cls, "openVirtual", "(JLjava/lang/String;I)V");
     g_midi.scan_bluetooth = jni.getStaticMethodID(jenv, cls, "scanBluetooth", "(JI)V");
     g_midi.stop_bluetooth_scan = jni.getStaticMethodID(jenv, cls, "stopBluetoothScan", "()V");
     g_midi.connect_bluetooth = jni.getStaticMethodID(jenv, cls, "connectBluetooth", "(JLjava/lang/String;)V");
@@ -137,7 +148,7 @@ export fn nif_midi_list_devices(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]con
     return callSelfVoid(env, g_midi.list_devices);
 }
 
-// open_input / open_output (device, port): capture the caller so events reach it.
+// open_output(device, port): capture the caller so events reach it.
 fn callSelfDevicePortVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, argv: [*]const erts.ERL_NIF_TERM) erts.ERL_NIF_TERM {
     if (mid == null) return notLoaded(env);
     var dev: c_int = 0;
@@ -154,9 +165,36 @@ fn callSelfDevicePortVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, argv: [*]co
     return erts.ok(env);
 }
 
+// open_input(device, port, route): port -1 = every port; route 1 = BEAM,
+// 2 = native sink, 3 = both.
 export fn nif_midi_open_input(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
-    return callSelfDevicePortVoid(env, g_midi.open_input, argv);
+    if (g_midi.open_input == null) return notLoaded(env);
+    var dev: c_int = 0;
+    var port: c_int = 0;
+    var route: c_int = 0;
+    if (erts.enif_get_int(env, argv[0], &dev) == 0 or erts.enif_get_int(env, argv[1], &port) == 0 or
+        erts.enif_get_int(env, argv[2], &route) == 0) return erts.badarg(env);
+    var pid: erts.ErlNifPid = undefined;
+    _ = erts.enif_self(env, &pid);
+    var attached: c_int = 0;
+    const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
+    defer detachIfAttached(attached);
+    jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, g_midi.open_input, pidToJlong(pid), @as(jni.JInt, dev), @as(jni.JInt, port), @as(jni.JInt, route));
+    if (clearPendingException(jenv)) return erts.atom(env, "error");
+    return erts.ok(env);
+}
+
+// midi_output_handle(device, port): the open output's mob_midi.h handle.
+export fn nif_midi_output_handle(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    var dev: c_int = 0;
+    var port: c_int = 0;
+    if (erts.enif_get_int(env, argv[0], &dev) == 0 or erts.enif_get_int(env, argv[1], &port) == 0)
+        return erts.badarg(env);
+    const handle = mob_midi__output_handle(dev, port);
+    if (handle <= 0) return erts.errorTuple(env, erts.atom(env, "not_open"));
+    return erts.makeTuple(env, .{ erts.atom(env, "ok"), erts.enif_make_int64(env, handle) });
 }
 
 export fn nif_midi_open_output(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
@@ -189,6 +227,15 @@ export fn nif_midi_send(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.
     var bin: erts.ErlNifBinary = undefined;
     if (erts.enif_inspect_binary(env, argv[2], &bin) == 0 and
         erts.enif_inspect_iolist_as_binary(env, argv[2], &bin) == 0) return erts.badarg(env);
+    if (bin.size == 0) return erts.ok(env);
+
+    switch (mob_midi__send_device(dev, port, bin.data, bin.size, ts)) {
+        MOB_MIDI_OK => return erts.ok(env),
+        MOB_MIDI_ERR_QUEUE_FULL => return erts.errorTuple(env, erts.atom(env, "queue_full")),
+        MOB_MIDI_ERR_NO_LISTENER => return erts.errorTuple(env, erts.atom(env, "no_listener")),
+        MOB_MIDI_ERR_NOT_OPEN => {}, // opening, or not open: Kotlin knows which
+        else => return erts.errorTuple(env, erts.atom(env, "send_failed")),
+    }
 
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
@@ -222,8 +269,8 @@ export fn nif_midi_now_ns(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const ert
     return erts.enif_make_int64(env, jni.nowNs());
 }
 
-// (pid, String) calls: open_virtual(name), connect_bluetooth(address).
-fn callSelfStringVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, arg: erts.ERL_NIF_TERM) erts.ERL_NIF_TERM {
+// (pid, String[, Int]) calls: connect_bluetooth(address), open_virtual(name, route).
+fn callSelfString(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, arg: erts.ERL_NIF_TERM, extra: ?c_int) erts.ERL_NIF_TERM {
     if (mid == null) return notLoaded(env);
     var bin: erts.ErlNifBinary = undefined;
     if (erts.enif_inspect_binary(env, arg, &bin) == 0) return erts.badarg(env);
@@ -241,20 +288,27 @@ fn callSelfStringVoid(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, arg: erts.ERL_N
         _ = clearPendingException(jenv);
         return erts.atom(env, "error");
     }
-    jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jstr);
+    if (extra) |x| {
+        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jstr, @as(jni.JInt, x));
+    } else {
+        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jstr);
+    }
     jni.deleteLocalRef(jenv, jstr);
     if (clearPendingException(jenv)) return erts.atom(env, "error");
     return erts.ok(env);
 }
 
+// open_virtual(name, route): route as for open_input.
 export fn nif_midi_open_virtual(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
-    return callSelfStringVoid(env, g_midi.open_virtual, argv[0]);
+    var route: c_int = 0;
+    if (erts.enif_get_int(env, argv[1], &route) == 0) return erts.badarg(env);
+    return callSelfString(env, g_midi.open_virtual, argv[0], route);
 }
 
 export fn nif_midi_connect_bluetooth(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
-    return callSelfStringVoid(env, g_midi.connect_bluetooth, argv[0]);
+    return callSelfString(env, g_midi.connect_bluetooth, argv[0], null);
 }
 
 export fn nif_midi_scan_bluetooth(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
@@ -300,36 +354,27 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiDevices(jenv: *jni
     sendMidi(env, pid_long, "devices", bin_term);
 }
 
-// The hot path: one incoming MIDI chunk, copied straight from the Java array
-// into the message binary.
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiRaw(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, port: jni.JInt, bytes: jni.JByteArray, offset: jni.JInt, count: jni.JInt, timestamp: jni.JLong, received: jni.JLong) callconv(.c) void {
-    _ = cls;
-    if (count <= 0) return;
-    const env = erts.enif_alloc_env() orelse return;
-    defer erts.enif_free_env(env);
-    var bin: erts.ErlNifBinary = undefined;
-    if (erts.enif_alloc_binary(@intCast(count), &bin) == 0) return;
-    jni.getByteArrayRegion(jenv, bytes, offset, count, @ptrCast(bin.data));
-    const bin_term = erts.enif_make_binary(env, &bin);
-    const map = erts.makeMap(
-        env,
-        &.{ erts.atom(env, "device"), erts.atom(env, "port"), erts.atom(env, "bytes"), erts.atom(env, "timestamp"), erts.atom(env, "received") },
-        &.{ erts.enif_make_int(env, @intCast(device)), erts.enif_make_int(env, @intCast(port)), bin_term, erts.enif_make_int64(env, timestamp), erts.enif_make_int64(env, received) },
-    ) orelse return;
-    sendMidi(env, pid_long, "raw", map);
-}
-
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiOpened(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, port: jni.JInt, direction: jni.JString) callconv(.c) void {
+// {:midi, :opened, %{device, port, direction}} plus, for an input, its
+// mob_midi.h `source` and, for an output, its `handle` (0 = none).
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiOpened(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, port: jni.JInt, direction: jni.JString, source: jni.JInt, handle: jni.JLong) callconv(.c) void {
     _ = cls;
     const dir_c = jni.getStringUTFChars(jenv, direction) orelse return;
     defer jni.releaseStringUTFChars(jenv, direction, dir_c);
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    const map = erts.makeMap(
-        env,
-        &.{ erts.atom(env, "device"), erts.atom(env, "port"), erts.atom(env, "direction") },
-        &.{ erts.enif_make_int(env, @intCast(device)), erts.enif_make_int(env, @intCast(port)), erts.enif_make_atom(env, dir_c) },
-    ) orelse return;
+    var keys = [_]erts.ERL_NIF_TERM{ erts.atom(env, "device"), erts.atom(env, "port"), erts.atom(env, "direction"), 0 };
+    var vals = [_]erts.ERL_NIF_TERM{ erts.enif_make_int(env, @intCast(device)), erts.enif_make_int(env, @intCast(port)), erts.enif_make_atom(env, dir_c), 0 };
+    var n: usize = 3;
+    if (source > 0) {
+        keys[n] = erts.atom(env, "source");
+        vals[n] = erts.enif_make_int(env, @intCast(source));
+        n += 1;
+    } else if (handle > 0) {
+        keys[n] = erts.atom(env, "handle");
+        vals[n] = erts.enif_make_int64(env, handle);
+        n += 1;
+    }
+    const map = erts.makeMap(env, keys[0..n], vals[0..n]) orelse return;
     sendMidi(env, pid_long, "opened", map);
 }
 
@@ -377,7 +422,7 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiEvent(jenv: *jni.J
     _ = erts.enif_send(null, &pid, env, msg);
 }
 
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, address: jni.JString, name: jni.JString) callconv(.c) void {
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, address: jni.JString, name: jni.JString, rssi: jni.JInt) callconv(.c) void {
     _ = cls;
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
@@ -385,8 +430,8 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(je
     const name_term = javaStringBinary(env, jenv, name) orelse return;
     const map = erts.makeMap(
         env,
-        &.{ erts.atom(env, "address"), erts.atom(env, "name") },
-        &.{ address_term, name_term },
+        &.{ erts.atom(env, "address"), erts.atom(env, "name"), erts.atom(env, "rssi") },
+        &.{ address_term, name_term, erts.enif_make_int(env, @intCast(rssi)) },
     ) orelse return;
     sendMidi(env, pid_long, "bluetooth_device", map);
 }
@@ -425,12 +470,13 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiError(jenv: *jni.J
 
 const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "midi_list_devices", .arity = 0, .fptr = nif_midi_list_devices, .flags = 0 },
-    .{ .name = "midi_open_input", .arity = 2, .fptr = nif_midi_open_input, .flags = 0 },
+    .{ .name = "midi_open_input", .arity = 3, .fptr = nif_midi_open_input, .flags = 0 },
     .{ .name = "midi_open_output", .arity = 2, .fptr = nif_midi_open_output, .flags = 0 },
     .{ .name = "midi_close", .arity = 1, .fptr = nif_midi_close, .flags = 0 },
     .{ .name = "midi_send", .arity = 4, .fptr = nif_midi_send, .flags = 0 },
     .{ .name = "midi_now_ns", .arity = 0, .fptr = nif_midi_now_ns, .flags = 0 },
-    .{ .name = "midi_open_virtual", .arity = 1, .fptr = nif_midi_open_virtual, .flags = 0 },
+    .{ .name = "midi_open_virtual", .arity = 2, .fptr = nif_midi_open_virtual, .flags = 0 },
+    .{ .name = "midi_output_handle", .arity = 2, .fptr = nif_midi_output_handle, .flags = 0 },
     .{ .name = "midi_scan_bluetooth", .arity = 1, .fptr = nif_midi_scan_bluetooth, .flags = 0 },
     .{ .name = "midi_stop_bluetooth_scan", .arity = 0, .fptr = nif_midi_stop_bluetooth_scan, .flags = 0 },
     .{ .name = "midi_connect_bluetooth", .arity = 1, .fptr = nif_midi_connect_bluetooth, .flags = 0 },
