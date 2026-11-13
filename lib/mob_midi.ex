@@ -308,7 +308,8 @@ defmodule MobMidi do
   CoreMIDI source + destination of that name; iOS doesn't report who is
   connected. `{:midi, :error, %{op: :open_virtual, reason: :no_such_device}}`
   when Android has no such device of this app's. A second `open_virtual/3`
-  replaces the first; `close/2` on the id ends it.
+  replaces the first; on Android `close/2` on the id ends it (iOS keeps
+  the CoreMIDI endpoints until the app exits).
   """
   @spec open_virtual(term(), String.t(), keyword()) :: term()
   def open_virtual(socket, name, opts \\ []) when is_binary(name) do

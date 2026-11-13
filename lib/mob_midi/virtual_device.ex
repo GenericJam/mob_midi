@@ -101,7 +101,7 @@ defmodule MobMidi.VirtualDevice do
       byte_size(value) > @max_text_bytes ->
         {:error, "#{key} must be at most #{@max_text_bytes} bytes"}
 
-      String.match?(value, ~r/[\x00-\x1F\x7F]/) ->
+      String.match?(value, Regex.compile!("[\\x00-\\x1F\\x7F]")) ->
         {:error, "#{key} must not contain control characters"}
 
       true ->
@@ -206,7 +206,11 @@ defmodule MobMidi.VirtualDevice do
   # The block's leading indentation and trailing newline go with it, so
   # remove + insert round-trips byte for byte.
   defp block_regex do
-    ~r/^[ \t]*#{Regex.escape(@begin_marker)}.*?#{Regex.escape(@end_marker)}[ \t]*\r?\n?/ms
+    Regex.compile!(
+      "^[ \\t]*" <>
+        Regex.escape(@begin_marker) <> ".*?" <> Regex.escape(@end_marker) <> "[ \\t]*\\r?\\n?",
+      "ms"
+    )
   end
 
   defp closing_application(xml) do
@@ -256,5 +260,5 @@ defmodule MobMidi.VirtualDevice do
   end
 
   # XML comments can't contain "--" and entities don't apply inside them.
-  defp comment_safe(value), do: Regex.replace(~r/-(?=-)/, value, "- ")
+  defp comment_safe(value), do: Regex.replace(Regex.compile!("-(?=-)"), value, "- ")
 end

@@ -27,8 +27,10 @@
  * sending into it, its GENERATION changes (it never repeats). Bytes are
  * delivered only for the current generation: once close returns, nothing of
  * the old port's stream reaches you, even a message its thread was already
- * delivering. A consumer that parses (see mob_midi_parser.h) keeps one parser
- * per source and resets it when the generation it is called with differs
+ * delivering (on the app's own virtual input ports the generation changes
+ * when the sending app changes; a late message of the previous sender racing
+ * that change can still land in the new one). A consumer that parses (see
+ * mob_midi_parser.h) keeps one parser per source and resets it when the generation it is called with differs
  * from the last one it saw: running status never leaks from one port into
  * the next.
  *
@@ -40,7 +42,8 @@
  * The sink is called on the port's MIDI receive thread (Android: one thread
  * per open port, so calls for different sources may run concurrently; calls
  * for one source never overlap), with the source's lock held. It must not
- * block, allocate unboundedly, or call mob_midi_set_sink. `bytes` is valid
+ * block, allocate unboundedly, or call mob_midi_set_sink; mob_midi_source_info
+ * and mob_midi_send are fine. `bytes` is valid
  * only during the call. A long message (SysEx) may arrive split over several
  * calls; treat it as a byte stream. `timestamp_ns` is the sender's stamp as
  * Android delivered it: most senders stamp System.nanoTime(), some stamp 0
@@ -56,8 +59,9 @@
  *
  * mob_midi_send copies the bytes into the port's queue (no allocation) and
  * returns. A per-port dispatch thread hands them to Android at `at_ns`
- * (MidiReceiver.send(..., timestamp = at_ns)), or at once when at_ns <= 0 or
- * already past (stamped with the enqueue time). Messages leave in timestamp
+ * (MidiReceiver.send(..., timestamp = at_ns)); at once when `at_ns` is
+ * already past (still stamped with `at_ns`), or when at_ns <= 0 (stamped with
+ * the enqueue time). Messages leave in timestamp
  * order, FIFO for equal stamps. The queue holds MOB_MIDI_QUEUE_CAPACITY
  * chunks of up to MOB_MIDI_CHUNK_BYTES bytes per port; a stalled receiver
  * fills it and further sends answer MOB_MIDI_ERR_QUEUE_FULL rather than

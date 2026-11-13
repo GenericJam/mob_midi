@@ -100,12 +100,13 @@ The header documents thread and lifetime rules;
 ## Bluetooth MIDI devices (Android)
 
 `MobMidi.scan_bluetooth(socket)` finds BLE-MIDI devices (`{:midi,
-:bluetooth_device, %{address: a, name: n}}`), `MobMidi.connect_bluetooth(socket,
+:bluetooth_device, %{address: a, name: n, rssi: dbm}}`), `MobMidi.connect_bluetooth(socket,
 address)` connects one, which then lists and opens like a USB device; `close/2`
 disconnects it. Ask for the `:midi_bluetooth` permission first
-(`Mob.Permissions.request(socket, :midi_bluetooth)`). On Android 11 and older,
-scanning needs `ACCESS_FINE_LOCATION`, which the host declares (with
-`android:maxSdkVersion="30"`). iOS pairs BLE-MIDI devices in the system UI
+(`Mob.Permissions.request(socket, :midi_bluetooth)`). The plugin declares the Bluetooth
+and location permissions scanning needs; the request includes location on every
+version (Android 12+ too, as mob_dev can't mark `BLUETOOTH_SCAN`
+`neverForLocation`), and scans need location switched on (`:location_off`). iOS pairs BLE-MIDI devices in the system UI
 (`CABTMIDICentralViewController`); they are then ordinary CoreMIDI devices.
 
 ## Demo screens (tier 3)

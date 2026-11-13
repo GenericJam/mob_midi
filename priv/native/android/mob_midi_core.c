@@ -54,8 +54,9 @@ int64_t mob_midi_now_ns(void) {
 int mob_midi_abi_version(void) { return MOB_MIDI_ABI_VERSION; }
 
 /* Generations of sources and outputs come from one counter, so none repeats
- * (a reused source or output slot never matches a stale stamp). 31 bits, as
- * output handles carry it above the slot index. */
+ * until it wraps after 2^31 opens/renewals (a reused source or output slot
+ * doesn't match a stale stamp). 31 bits, as output handles carry it above the
+ * slot index. */
 static atomic_uint g_generation = 0;
 
 static uint32_t next_generation(void) {
@@ -111,6 +112,11 @@ typedef struct {
     uint32_t route;
     int64_t pid; /* the opener, as MobMidiBridge carries pids (a jlong) */
     int32_t device, port;
+    /* Lock-free copy for mob_midi_source_info (callable from the sink, which
+     * runs under `lock`): the generation while open (0 when closed) and
+     * (device << 32) | port. */
+    _Atomic uint32_t open_generation;
+    _Atomic uint64_t where;
 } source_t;
 
 static source_t g_sources[MOB_MIDI_MAX_SOURCES];
@@ -128,15 +134,23 @@ int mob_midi_source_info(uint32_t source, uint32_t *generation, int32_t *device,
     if (source == 0 || source >= MOB_MIDI_MAX_SOURCES) return MOB_MIDI_ERR_INVALID;
     ensure_init();
     source_t *s = &g_sources[source];
-    pthread_mutex_lock(&s->lock);
-    bool used = s->used;
-    if (used) {
-        if (generation) *generation = s->generation;
-        if (device) *device = s->device;
-        if (port) *port = s->port;
+    for (;;) {
+        uint32_t g = atomic_load(&s->open_generation);
+        if (g == 0) return MOB_MIDI_ERR_INVALID;
+        uint64_t w = atomic_load(&s->where);
+        if (atomic_load(&s->open_generation) != g) continue; /* changed under us */
+        if (generation) *generation = g;
+        if (device) *device = (int32_t)(w >> 32);
+        if (port) *port = (int32_t)(w & 0xffffffffu);
+        return MOB_MIDI_OK;
     }
-    pthread_mutex_unlock(&s->lock);
-    return used ? MOB_MIDI_OK : MOB_MIDI_ERR_INVALID;
+}
+
+/* Under the source's lock. */
+static void publish(source_t *s) {
+    atomic_store(&s->open_generation, 0);
+    atomic_store(&s->where, ((uint64_t)(uint32_t)s->device << 32) | (uint32_t)s->port);
+    atomic_store(&s->open_generation, s->used ? s->generation : 0);
 }
 
 /* MobMidiBridge.nativeSourceOpen(device, port, pid, route): a free source
@@ -167,6 +181,7 @@ JNIEXPORT jlong JNICALL Java_io_mob_midi_MobMidiBridge_nativeSourceOpen(JNIEnv *
         s->pid = pid;
         s->device = device;
         s->port = port;
+        publish(s);
         result = ((jlong)found << 32) | s->generation;
         pthread_mutex_unlock(&s->lock);
         g_last_source = found;
@@ -186,6 +201,7 @@ JNIEXPORT jint JNICALL Java_io_mob_midi_MobMidiBridge_nativeSourceRenew(JNIEnv *
     source_t *s = &g_sources[source];
     pthread_mutex_lock(&s->lock);
     uint32_t g = s->used ? (s->generation = next_generation()) : 0;
+    publish(s);
     pthread_mutex_unlock(&s->lock);
     return (jint)g;
 }
@@ -204,6 +220,7 @@ JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeSourceClose(JNIEnv *
     s->generation = next_generation();
     s->route = 0;
     s->pid = 0;
+    publish(s);
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&g_sources_lock);
 }

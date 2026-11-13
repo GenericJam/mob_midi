@@ -28,7 +28,7 @@
 //
 // Opening an output is asynchronous (MidiManager.openDevice calls back on the
 // main looper). Sends made between openOutput and that callback are queued
-// here (bounded, MAX_PENDING_SENDS) and moved, in order, into the C queue
+// here (bounded by PENDING_CHUNKS, the C queue's size) and moved, in order, into the C queue
 // once the port exists. The opener then gets {:midi, :opened, %{device, port,
 // direction: :output, handle}}; on failure {:midi, :error, %{device, op:
 // :open_output, reason, dropped}} and the queue is discarded.
@@ -67,6 +67,7 @@ import android.os.Process
 import java.io.IOException
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicIntegerArray
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -174,11 +175,13 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     private const val SEND_FAILED = 4
     private const val SEND_NO_LISTENER = 5
 
-    // Messages buffered per port while its output is opening. A burst larger
-    // than this before the port exists is the caller's bug; extra sends get
-    // SEND_QUEUE_FULL instead of growing without bound. Matches the C queue
-    // (MOB_MIDI_QUEUE_CAPACITY) so a full pending queue fits on open.
-    private const val MAX_PENDING_SENDS = 256
+    // What may be buffered per port while its output is opening, counted in
+    // the C queue's 64-byte chunks (MOB_MIDI_QUEUE_CAPACITY x
+    // MOB_MIDI_CHUNK_BYTES), so the whole pending queue always fits the C
+    // queue on open. More before the port exists is the caller's bug: extra
+    // sends get SEND_QUEUE_FULL instead of growing without bound.
+    private const val PENDING_CHUNKS = 256
+    private const val CHUNK_BYTES = 64
 
     // The BLE-MIDI GATT service (MIDI over Bluetooth LE 1.0).
     private const val BLE_MIDI_SERVICE = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700"
@@ -194,6 +197,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
 
     private class PendingOutput(val pids: MutableList<Long>) {
         val queue = ArrayDeque<Pending>()
+        var chunks = 0
     }
 
     // An open input port: its Android port and its C source.
@@ -241,7 +245,12 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
 
     // An open_virtual subscription: the C sources of the device's input ports
     // (and their current generations) and the handles of its output ports.
-    private class Virtual(val pid: Long, val sources: IntArray, val generations: IntArray, val handles: LongArray)
+    private class Virtual(
+        val pid: Long,
+        val sources: IntArray,
+        val generations: AtomicIntegerArray,
+        val handles: LongArray,
+    )
 
     private var activityRef: WeakReference<Activity>? = null
     private val main = Handler(Looper.getMainLooper())
@@ -264,6 +273,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     private val sendLock = Any()
     private val outputs = HashMap<Long, OpenOutput>() // (device, port) -> send port
     private val pendingOutputs = HashMap<Long, PendingOutput>()
+
+    // Bumped by close(device) under sendLock: an input open still in flight
+    // on the worker sees it and gives up, so nothing opens after close.
+    private val closes = HashMap<Int, Int>()
 
     // The app's own virtual devices (MobMidiDeviceService subclasses), by
     // device id: open_virtual's subscription, the running services and the
@@ -474,28 +487,41 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         if (ports.isEmpty() || ports.any { it < 0 || it >= info.outputPortCount }) {
             nativeDeliverMidiError(pid, deviceId, "open_input", "no_such_port", 0); return
         }
-        withDevice(mm, info) { device ->
-            for (p in ports) openInputPort(pid, deviceId, p, route, device)
-            releaseUnusedDevice(deviceId)
+        val epoch = synchronized(sendLock) { closes[deviceId] ?: 0 }
+        worker.post {
+            withDevice(mm, info) { device ->
+                for (p in ports) openInputPort(pid, deviceId, p, route, device, epoch)
+                releaseUnusedDevice(deviceId)
+            }
         }
     }
 
-    private fun openInputPort(pid: Long, deviceId: Int, port: Int, route: Int, device: MidiDevice?) {
+    private fun openInputPort(pid: Long, deviceId: Int, port: Int, route: Int, device: MidiDevice?, epoch: Int) {
         val out = device?.openOutputPort(port)
         if (out == null) {
             nativeDeliverMidiError(pid, deviceId, "open_input", if (device == null) "open_failed" else "no_output_port", 0)
             return
         }
-        // Reopening a port replaces its subscription.
-        closeInput(key(deviceId, port))
-        val packed = nativeSourceOpen(deviceId, port, pid, route)
-        if (packed < 0) {
+        val k = key(deviceId, port)
+        // Under sendLock with close(): either close() ran first (epoch moved:
+        // give up) or it will find this input and close it.
+        val packed = synchronized(sendLock) {
+            if ((closes[deviceId] ?: 0) != epoch) {
+                null
+            } else {
+                // Reopening a port replaces its subscription.
+                closeInput(k)
+                nativeSourceOpen(deviceId, port, pid, route).also {
+                    if (it >= 0) inputs[k] = OpenInput(out, (it shr 32).toInt())
+                }
+            }
+        }
+        if (packed == null || packed < 0) {
             closeQuietly(out)
-            nativeDeliverMidiError(pid, deviceId, "open_input", "no_free_source", 0)
+            nativeDeliverMidiError(pid, deviceId, "open_input", if (packed == null) "closed" else "no_free_source", 0)
             return
         }
         val source = (packed shr 32).toInt()
-        inputs[key(deviceId, port)] = OpenInput(out, source)
         out.connect(SourceReceiver(source, packed.toInt()))
         nativeDeliverMidiOpened(pid, deviceId, port, "input", source, 0)
     }
@@ -542,7 +568,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         if (handle != null) {
             nativeDeliverMidiOpened(pid, deviceId, port, "output", 0, handle); return
         }
-        withDevice(mm, info) { device -> finishOpenOutput(deviceId, port, device) }
+        worker.post { withDevice(mm, info) { device -> finishOpenOutput(deviceId, port, device) } }
     }
 
     private fun finishOpenOutput(deviceId: Int, port: Int, device: MidiDevice?) {
@@ -597,7 +623,9 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     // Bluetooth device stays open: closing it would disconnect it.
     private fun releaseUnusedDevice(deviceId: Int) {
         val inUse = inputs.keys.any { deviceOf(it) == deviceId } ||
-            synchronized(sendLock) { outputs.keys.any { deviceOf(it) == deviceId } } ||
+            synchronized(sendLock) {
+                outputs.keys.any { deviceOf(it) == deviceId } || pendingOutputs.keys.any { deviceOf(it) == deviceId }
+            } ||
             openDevices[deviceId]?.info?.type == MidiDeviceInfo.TYPE_BLUETOOTH
         if (!inUse) closeLater(openDevices.remove(deviceId))
     }
@@ -621,11 +649,13 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                 }
             } else {
                 val pending = pendingOutputs[k]
+                val need = (bytes.size + CHUNK_BYTES - 1) / CHUNK_BYTES
                 when {
                     pending == null -> SEND_NOT_OPEN
-                    pending.queue.size >= MAX_PENDING_SENDS -> SEND_QUEUE_FULL
+                    pending.chunks + need > PENDING_CHUNKS -> SEND_QUEUE_FULL
                     else -> {
                         pending.queue.addLast(Pending(bytes, ts))
+                        pending.chunks += need
                         SEND_QUEUED
                     }
                 }
@@ -643,6 +673,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         val cancelled = ArrayList<PendingOutput>()
         val closed = ArrayList<OpenOutput>()
         synchronized(sendLock) {
+            closes[deviceId] = (closes[deviceId] ?: 0) + 1
             pendingOutputs.keys.filter { deviceOf(it) == deviceId }.forEach { k ->
                 pendingOutputs.remove(k)?.let { cancelled.add(it) }
             }
@@ -707,7 +738,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
             return
         }
         synchronized(virtualLock) {
-            virtuals[id] = Virtual(pid, sources, generations, handles)
+            virtuals[id] = Virtual(pid, sources, AtomicIntegerArray(generations), handles)
             val status = virtualStatus[id]
             for (p in handles.indices) {
                 nativeOutputReady(handles[p])
@@ -757,7 +788,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     internal fun fromVirtual(deviceId: Int, port: Int, msg: ByteArray, offset: Int, count: Int, timestamp: Long) {
         val v = virtuals[deviceId] ?: return
         if (port >= v.sources.size || count <= 0) return
-        nativeReceive(v.sources[port], v.generations[port], msg, offset, count, timestamp)
+        nativeReceive(v.sources[port], v.generations.get(port), msg, offset, count, timestamp)
     }
 
     // An input port whose sender came or went starts a new generation: the
@@ -770,7 +801,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
             val now = new?.isInputPortOpen(p) ?: false
             if (was != now) {
                 val g = nativeSourceRenew(v.sources[p])
-                if (g != 0) v.generations[p] = g
+                if (g != 0) v.generations.set(p, g)
             }
         }
     }
