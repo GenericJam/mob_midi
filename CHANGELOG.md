@@ -38,11 +38,14 @@ home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
 - **`{:midi, :drained, %{device, port, handle, generation}}` and
   `discard/2`** (Android): after a send answered `{:error, :queue_full}`, the
   port refuses every send until its queue has drained (the dispatch thread is
-  back from the write it was stuck in and at most 128 chunks are left); then
+  back from the write it was stuck in, at most 128 chunks are left and the
+  largest message refused meanwhile fits); then
   the port's opener gets `:drained`. `discard/2` (C: `mob_midi_discard`)
   drops what is queued and starts a new queue generation, which `:drained`
-  carries. The queue logic lives in `priv/native/android/mob_midi_queue.h`,
-  with a host C test.
+  carries (an own virtual output whose listeners all leave drops its queue,
+  bumps the generation and still reports `:drained` if it was refusing). The
+  queue logic lives in `priv/native/android/mob_midi_queue.h`, with a host C
+  test.
 
 ### Changed
 - **Android sends go through a per-port queue** (256 chunks of 64 bytes,
@@ -62,6 +65,13 @@ home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
   `:opened` of an open asked for before it can arrive (it answers `{:midi,
   :error, %{reason: :closed}}`); `:opened` is sent under the same lock
   `close/2` takes.
+- Opens of one device share a single `MidiManager.openDevice` in flight
+  (Android). On Android ≤ 11 the system's `MidiService` walks a device's
+  connection list unlocked when its service connects, so a connection added
+  or removed meanwhile crashes `system_server` (the phone's system restarts).
+  Opening and closing a slow-starting device service in a loop, each open
+  adding a connection of its own, did that on an Android 10 phone. It also
+  ends the `:open_failed` a second open got while the first was in flight.
 - Text that carries names (the device list JSON, a virtual device's name, BLE
   names and addresses) crosses JNI as UTF-8 byte arrays both ways, not
   `GetStringUTFChars` / `NewStringUTF` (modified UTF-8 split characters

@@ -68,7 +68,8 @@
  * fills it and further sends answer MOB_MIDI_ERR_QUEUE_FULL rather than
  * block. Once a send has been refused, every send to the port is refused
  * until the queue has DRAINED: the dispatch thread is back from the send it
- * was stuck in and at most MOB_MIDI_QUEUE_CAPACITY / 2 chunks are left. The
+ * was stuck in, at most MOB_MIDI_QUEUE_CAPACITY / 2 chunks are left and the
+ * largest message refused meanwhile fits. The
  * port's opener then gets {:midi, :drained, %{device, port, handle,
  * generation}}; native code sees sends succeed again. mob_midi_discard drops
  * what is queued (stale notes a stalled receiver would get late) and starts
@@ -139,7 +140,8 @@ int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len, int64_t 
 
 /* Drop everything queued for output `port`: the new queue generation (> 0),
  * or MOB_MIDI_ERR_NOT_OPEN. A port refusing sends keeps refusing until it
- * has drained (the drained event carries this generation). */
+ * has drained (the drained event carries this generation, or a later one
+ * when an own virtual output's listeners all left meanwhile). */
 int mob_midi_discard(mob_midi_port port);
 
 /* CLOCK_MONOTONIC in ns. */

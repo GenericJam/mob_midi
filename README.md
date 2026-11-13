@@ -39,13 +39,15 @@ bind the result instead of piping it on as the socket.
 **Back-pressure (Android).** Sends join the port's queue and a thread of the
 port's own writes them, so a listener that stops reading never blocks the
 caller. When its queue is full, the send answers `{:error, :queue_full}` and
-the port refuses every send until it has drained (the stuck write returned
-and at most half the queue is left). The process that opened the port then
-gets `{:midi, :drained, %{device: id, port: n, handle: h, generation: g}}`.
+the port refuses every send until it has drained (the stuck write returned,
+at most half the queue is left and the largest refused message fits). The
+process that opened the port then gets
+`{:midi, :drained, %{device: id, port: n, handle: h, generation: g}}`.
 `MobMidi.discard(id, port: n)` drops what is still queued (stale notes the
 listener would otherwise play late) and returns `{:ok, generation}`; the next
-`:drained` carries it. The usual reaction to `:queue_full`: discard, wait for
-`:drained`, send note-offs or all-notes-off, then carry on.
+`:drained` carries it, or a later one (an own virtual output whose listeners
+all leave drops its queue too). The usual reaction to `:queue_full`: discard,
+wait for `:drained`, send note-offs or all-notes-off, then carry on.
 
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.

@@ -94,7 +94,8 @@ caller's job (Magpie keeps its frame→`CLOCK_MONOTONIC` mapping).
   stops reading blocks its own queue (sends then answer `queue_full`), never
   the BEAM or other ports. Humdinger's overflow rule comes with it (round 3):
   after one refusal the port refuses until it has drained (the dispatcher is
-  back from the stuck write and at most half the queue is left), then its
+  back from the stuck write, at most half the queue is left and the largest
+  refused message fits), then its
   opener gets `{:midi, :drained, %{device, port, handle, generation}}`;
   `MobMidi.discard/2` / `mob_midi_discard` drop the stale queue and start a
   new generation. Unlike Humdinger, the queue isn't dropped on overflow by

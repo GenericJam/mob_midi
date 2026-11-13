@@ -127,16 +127,37 @@ static void test_discard(void) {
     CHECK(mob_midi_queue_discard(&q) == 1);
 }
 
-static void test_abandon(void) {
+static void test_drained_waits_until_the_refused_message_fits(void) {
+    static uint8_t big[MOB_MIDI_QUEUE_MAX_BYTES], mid[MOB_MIDI_QUEUE_MAX_BYTES / 2 + 1], out[MOB_MIDI_QUEUE_MAX_BYTES];
+    int64_t stamp = 0;
     mob_midi_queue_reset(&q);
-    for (int i = 0; i < MOB_MIDI_QUEUE_CAPACITY; i++) CHECK(push1(0x90, 10) == MOB_MIDI_OK);
-    CHECK(push1(0x90, 10) == MOB_MIDI_ERR_QUEUE_FULL);
-    /* The last listener left: nothing to drain into, no drain report. */
-    mob_midi_queue_abandon(&q);
-    CHECK(q.count == 0 && !q.refusing);
-    CHECK(q.generation == 2);
+    /* One note scheduled ahead: a whole-queue message doesn't fit beside it. */
+    CHECK(push1(0x90, 100) == MOB_MIDI_OK);
+    CHECK(mob_midi_queue_push(&q, big, sizeof big, 1) == MOB_MIDI_ERR_QUEUE_FULL);
+    /* Idle and under low water, but the refused message still wouldn't fit. */
+    mob_midi_queue_idle(&q);
     CHECK(!mob_midi_queue_drained(&q));
-    CHECK(push1(0x90, 10) == MOB_MIDI_OK);
+    /* A smaller send meanwhile doesn't lower the bar. */
+    CHECK(push1(0x80, 1) == MOB_MIDI_ERR_QUEUE_FULL);
+    CHECK(!mob_midi_queue_drained(&q));
+    /* The note goes out: now it fits, and the resend is accepted. */
+    CHECK(round_trip(100, out, (int)sizeof out, &stamp) == 1);
+    mob_midi_queue_idle(&q);
+    CHECK(mob_midi_queue_drained(&q));
+    CHECK(mob_midi_queue_push(&q, big, sizeof big, 200) == MOB_MIDI_OK);
+
+    /* The largest refusal counts: 129 chunks, then 1, need 129 free. */
+    mob_midi_queue_reset(&q);
+    for (int i = 0; i < MOB_MIDI_QUEUE_CAPACITY; i++) CHECK(push1(0xF8, 300) == MOB_MIDI_OK);
+    CHECK(mob_midi_queue_push(&q, mid, sizeof mid, 1) == MOB_MIDI_ERR_QUEUE_FULL);
+    CHECK(push1(0x80, 1) == MOB_MIDI_ERR_QUEUE_FULL);
+    for (int i = 0; i < 128; i++) CHECK(round_trip(300, out, 1, &stamp) == 1);
+    mob_midi_queue_idle(&q);
+    CHECK(q.count == MOB_MIDI_QUEUE_LOW_WATER && !mob_midi_queue_drained(&q));
+    CHECK(round_trip(300, out, 1, &stamp) == 1);
+    mob_midi_queue_idle(&q);
+    CHECK(mob_midi_queue_drained(&q));
+    CHECK(mob_midi_queue_push(&q, mid, sizeof mid, 400) == MOB_MIDI_OK);
 }
 
 static void test_chunks_count_against_capacity(void) {
@@ -182,7 +203,7 @@ int main(void) {
     test_long_message();
     test_refuses_until_drained();
     test_discard();
-    test_abandon();
+    test_drained_waits_until_the_refused_message_fits();
     test_chunks_count_against_capacity();
     test_too_large_is_not_a_refusal();
     test_messages_are_never_split();

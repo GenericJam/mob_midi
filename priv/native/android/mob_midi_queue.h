@@ -8,9 +8,10 @@
  * order, FIFO for equal times. Back-pressure follows a refuse-until-drained
  * rule: the first push that doesn't fit answers MOB_MIDI_ERR_QUEUE_FULL and
  * from then on every push does, until the queue has drained, i.e. the
- * dispatcher is no longer inside a send (a stalled receiver let go) and the
- * queue is down to MOB_MIDI_QUEUE_LOW_WATER chunks. mob_midi_queue_drained()
- * reports that moment once, so the opener hears {:midi, :drained, ...}. A
+ * dispatcher is no longer inside a send (a stalled receiver let go), the
+ * queue is down to MOB_MIDI_QUEUE_LOW_WATER chunks and the largest message
+ * refused since would fit. mob_midi_queue_drained() reports that moment once,
+ * so the opener hears {:midi, :drained, ...}. A
  * sender can't trickle bytes into a port that just refused them, and gets
  * one clear signal to resume on.
  *
@@ -49,6 +50,7 @@ typedef struct {
 typedef struct {
     uint64_t seq;
     int count;
+    int want;            /* chunks of the largest message refused since refusing began */
     bool refusing;       /* refused a push; refuses all until drained */
     bool sending;        /* the dispatcher is inside a send */
     uint32_t generation; /* 1.. (31 bits), bumped by every discard */
@@ -58,6 +60,7 @@ typedef struct {
 static inline void mob_midi_queue_reset(mob_midi_queue *q) {
     q->seq = 0;
     q->count = 0;
+    q->want = 0;
     q->refusing = false;
     q->sending = false;
     q->generation = 1;
@@ -92,6 +95,13 @@ static inline void mob_midi_queue_heap_pop(mob_midi_queue *q) {
     if (q->count > 0) q->heap[i] = last;
 }
 
+/* A push of `chunks` chunks was refused: refuse everything until drained,
+ * which waits until that message would fit. */
+static inline void mob_midi_queue_refuse(mob_midi_queue *q, int chunks) {
+    q->refusing = true;
+    if (chunks > q->want) q->want = chunks;
+}
+
 /* `len` bytes (> 0) stamped and due at `stamp`, split into chunks. MOB_MIDI_OK,
  * MOB_MIDI_ERR_QUEUE_FULL (nothing queued; refusing from now on) or
  * MOB_MIDI_ERR_TOO_LARGE (over MOB_MIDI_QUEUE_MAX_BYTES). A message's chunks
@@ -99,10 +109,9 @@ static inline void mob_midi_queue_heap_pop(mob_midi_queue *q) {
  * order: anything due earlier sorts before all of them. */
 static inline int mob_midi_queue_push(mob_midi_queue *q, const uint8_t *bytes, size_t len, int64_t stamp) {
     if (len > MOB_MIDI_QUEUE_MAX_BYTES) return MOB_MIDI_ERR_TOO_LARGE;
-    if (q->refusing) return MOB_MIDI_ERR_QUEUE_FULL;
     size_t chunks = (len + MOB_MIDI_CHUNK_BYTES - 1) / MOB_MIDI_CHUNK_BYTES;
-    if ((size_t)q->count + chunks > MOB_MIDI_QUEUE_CAPACITY) {
-        q->refusing = true;
+    if (q->refusing || (size_t)q->count + chunks > MOB_MIDI_QUEUE_CAPACITY) {
+        mob_midi_queue_refuse(q, (int)chunks);
         return MOB_MIDI_ERR_QUEUE_FULL;
     }
     mob_midi_qmsg m;
@@ -125,10 +134,14 @@ static inline int mob_midi_queue_push(mob_midi_queue *q, const uint8_t *bytes, s
 static inline void mob_midi_queue_idle(mob_midi_queue *q) { q->sending = false; }
 
 /* True exactly once per refusal, when the queue has drained: admission
- * reopens and the caller reports it. */
+ * reopens and the caller reports it. Every message refused meanwhile fits
+ * then, so a resend after the report isn't refused again at once. */
 static inline bool mob_midi_queue_drained(mob_midi_queue *q) {
-    if (!q->refusing || q->sending || q->count > MOB_MIDI_QUEUE_LOW_WATER) return false;
+    if (!q->refusing || q->sending || q->count > MOB_MIDI_QUEUE_LOW_WATER ||
+        q->count + q->want > MOB_MIDI_QUEUE_CAPACITY)
+        return false;
     q->refusing = false;
+    q->want = 0;
     return true;
 }
 
@@ -166,13 +179,6 @@ static inline uint32_t mob_midi_queue_discard(mob_midi_queue *q) {
     q->generation = (q->generation + 1) & 0x7fffffffu;
     if (q->generation == 0) q->generation = 1;
     return q->generation;
-}
-
-/* Nobody listens any more (an own virtual output): queued bytes are for no
- * one and there is nothing to drain into. No drained report follows. */
-static inline void mob_midi_queue_abandon(mob_midi_queue *q) {
-    mob_midi_queue_discard(q);
-    q->refusing = false;
 }
 
 #endif /* MOB_MIDI_QUEUE_H */

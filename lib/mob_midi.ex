@@ -98,16 +98,18 @@ defmodule MobMidi do
 
   Once a send has answered `{:error, :queue_full}`, the port refuses every
   send until its queue has drained (the receiver took the write it was stuck
-  in and at most 128 chunks are left). Then the process that opened the port
+  in, at most 128 chunks are left and the largest message refused meanwhile
+  fits). Then the process that opened the port
   (the last `open_output/3` or `open_virtual/3` caller) gets:
 
       {:midi, :drained, %{device: id, port: n, handle: h, generation: g}}
 
   What is still queued at a refusal is usually stale (notes a stalled
   receiver would play late): `discard/2` drops it and starts a new queue
-  `generation`, which the drained event carries. So an app that sees
-  `:queue_full` can discard, wait for `:drained`, then send what releases
-  the receiver's notes before anything new.
+  `generation`, which the drained event carries (or a later one: an own
+  virtual output whose listeners all leave drops its queue too). So an app
+  that sees `:queue_full` can discard, wait for `:drained`, then send what
+  releases the receiver's notes before anything new.
 
   `send_*` return `socket` when the message was queued, and `{:error,
   reason}` when it wasn't: `:not_open` (no `open_output/2` for that device, or
@@ -353,8 +355,9 @@ defmodule MobMidi do
   Drop everything queued for an open output (Android): `device_id`'s `port:`
   (default 0), an output of `open_output/3` or of the app's own virtual
   device. Returns `{:ok, generation}`, the port's new queue generation, which
-  the next `{:midi, :drained, ...}` carries; `{:error, :not_open}` when the
-  port isn't open (yet); `{:error, :unsupported}` elsewhere.
+  the next `{:midi, :drained, ...}` carries (or a later one);
+  `{:error, :not_open}` when the port isn't open (yet); `{:error,
+  :unsupported}` elsewhere.
 
   Meant for a port that answered `{:error, :queue_full}`: what it still
   holds would reach a stalled receiver late. A port that is refusing sends

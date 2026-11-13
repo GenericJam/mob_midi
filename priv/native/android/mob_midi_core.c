@@ -447,17 +447,18 @@ JNIEXPORT jlong JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputOpen(JNIEnv *
     return handle;
 }
 
-/* Sends are accepted from now on. `refused`: Kotlin's queue refused a send
- * while the port was opening, so this queue starts out refusing and its
- * opener hears {:midi, :drained, ...} once it has room. */
+/* Sends are accepted from now on. `refused_chunks` > 0: Kotlin's queue
+ * refused a send of that many chunks (the largest) while the port was
+ * opening, so this queue starts out refusing and its opener hears
+ * {:midi, :drained, ...} once that send would fit. */
 JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputReady(JNIEnv *j, jclass cls, jlong handle,
-                                                                        jboolean refused) {
+                                                                        jint refused_chunks) {
     (void)j;
     (void)cls;
     out_slot *o = lock_handle(handle);
     if (!o) return;
     o->state = OUT_OPEN;
-    if (refused) o->q.refusing = true;
+    if (refused_chunks > 0) mob_midi_queue_refuse(&o->q, refused_chunks);
     pthread_cond_signal(&o->cond);
     pthread_mutex_unlock(&o->lock);
 }
@@ -499,8 +500,14 @@ JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputListeners(JNIE
     out_slot *o = lock_handle(handle);
     if (!o) return;
     o->listeners = listeners;
-    /* Nobody to hear what is queued, nothing to drain into. */
-    if (listeners <= 0) mob_midi_queue_abandon(&o->q);
+    /* Nobody to hear what is queued: drop it (a new generation, so the
+     * :drained that still ends a refusal tells the opener it went). The
+     * dispatch thread sends that :drained once it is back from any send it
+     * is stuck in. An idle port keeps its generation. */
+    if (listeners <= 0 && (o->q.count > 0 || o->q.refusing)) {
+        mob_midi_queue_discard(&o->q);
+        pthread_cond_signal(&o->cond);
+    }
     pthread_mutex_unlock(&o->lock);
 }
 
