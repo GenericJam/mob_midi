@@ -21,7 +21,7 @@
 //!
 //! midi_send returns :ok (queued for the port's dispatch thread), :queued
 //! (output still opening; flushed in order when it opens) or {:error,
-//! :not_open | :queue_full | :send_failed | :no_listener}. An open output's
+//! :not_open | :queue_full | :send_failed | :no_listener | :too_large}. An open output's
 //! bytes go straight into its queue in mob_midi_core.c (no JNI); only a port
 //! that isn't open yet takes the Kotlin path. Timestamps are CLOCK_MONOTONIC
 //! ns (System.nanoTime), the clock of midi_now_ns/0. midi_discard drops an
@@ -52,6 +52,7 @@ const MOB_MIDI_OK: c_int = 0;
 const MOB_MIDI_ERR_NOT_OPEN: c_int = -1;
 const MOB_MIDI_ERR_QUEUE_FULL: c_int = -2;
 const MOB_MIDI_ERR_NO_LISTENER: c_int = -3;
+const MOB_MIDI_ERR_TOO_LARGE: c_int = -7;
 
 // enif_get_int64 is a macro for enif_get_long where long is 64-bit (as in
 // erl_nif.h), a real symbol elsewhere.
@@ -255,6 +256,7 @@ export fn nif_midi_send(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.
         MOB_MIDI_OK => return erts.ok(env),
         MOB_MIDI_ERR_QUEUE_FULL => return erts.errorTuple(env, erts.atom(env, "queue_full")),
         MOB_MIDI_ERR_NO_LISTENER => return erts.errorTuple(env, erts.atom(env, "no_listener")),
+        MOB_MIDI_ERR_TOO_LARGE => return erts.errorTuple(env, erts.atom(env, "too_large")),
         MOB_MIDI_ERR_NOT_OPEN => {}, // opening, or not open: Kotlin knows which
         else => return erts.errorTuple(env, erts.atom(env, "send_failed")),
     }
@@ -280,6 +282,7 @@ export fn nif_midi_send(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.
         2 => erts.errorTuple(env, erts.atom(env, "not_open")),
         3 => erts.errorTuple(env, erts.atom(env, "queue_full")),
         5 => erts.errorTuple(env, erts.atom(env, "no_listener")),
+        6 => erts.errorTuple(env, erts.atom(env, "too_large")),
         else => erts.errorTuple(env, erts.atom(env, "send_failed")),
     };
 }

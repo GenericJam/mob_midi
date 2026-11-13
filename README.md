@@ -33,7 +33,7 @@ the moment it does. If the open fails, the queue is discarded and the error's
 `dropped` counts the lost messages (`close/2` during the open reports `reason:
 :closed` the same way). `send_*` return `socket` when the message was written or
 queued and `{:error, reason}` when it wasn't (`:not_open`, `:queue_full`,
-`:no_such_device`, `:too_large` for iOS sends over 256 bytes, `:send_failed`), so
+`:no_such_device`, `:too_large` for one send over 256 bytes on iOS or 16 KiB on Android, `:send_failed`), so
 bind the result instead of piping it on as the socket.
 
 **Back-pressure (Android).** Sends join the port's queue and a thread of the

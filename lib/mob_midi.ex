@@ -112,7 +112,7 @@ defmodule MobMidi do
   `send_*` return `socket` when the message was queued, and `{:error,
   reason}` when it wasn't: `:not_open` (no `open_output/2` for that device, or
   it was closed or failed to open), `:queue_full`, `:no_such_device` (iOS: the
-  destination disappeared), `:too_large` (iOS: over 256 bytes in one send),
+  destination disappeared), `:too_large` (one send over 256 bytes on iOS, over 16 KiB on Android),
   `:no_listener` (a virtual device nobody listens to) or `:send_failed`;
   `{:error, :unsupported}` on the host and `{:error, :nif_not_loaded}` if the
   native bridge isn't registered. So bind the result rather than piping it on

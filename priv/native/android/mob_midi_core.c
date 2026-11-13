@@ -38,9 +38,10 @@
 /* Bytes per call to the sink: a stack buffer, refilled for longer chunks. */
 #define SINK_BUF 256
 
-/* The dispatch thread's batch: messages due now with the same stamp go out
- * in one MidiReceiver.send. Kotlin's buffer has this size. */
-#define DISPATCH_MAX 1024
+/* The dispatch thread's batch: whole messages due now with the same stamp go
+ * out in one MidiReceiver.send (which splits by the port's message size).
+ * One message can be the whole queue. Kotlin's buffer has this size. */
+#define DISPATCH_MAX MOB_MIDI_QUEUE_MAX_BYTES
 
 #define OUT_SLOTS 32
 
@@ -354,11 +355,13 @@ static out_slot *lock_handle(mob_midi_port handle) {
     return o;
 }
 
-/* Under the slot's lock. */
+/* Under the slot's lock. A refusal wakes the dispatcher too: one that is
+ * idle (empty queue, or waiting on a later message) must look again, as the
+ * queue may already be drained. */
 static int enqueue_locked(out_slot *o, const uint8_t *bytes, size_t len, int64_t at_ns) {
     if (o->virtual_port && o->listeners <= 0) return MOB_MIDI_ERR_NO_LISTENER;
     int rc = mob_midi_queue_push(&o->q, bytes, len, at_ns > 0 ? at_ns : mob_midi_now_ns());
-    if (rc == MOB_MIDI_OK) pthread_cond_signal(&o->cond);
+    if (rc == MOB_MIDI_OK || rc == MOB_MIDI_ERR_QUEUE_FULL) pthread_cond_signal(&o->cond);
     return rc;
 }
 
@@ -541,9 +544,9 @@ static void deliver_drained(const out_slot *o, mob_midi_port handle) {
 }
 
 /* MobMidiBridge.nativeNextSend(handle, buf, meta): the dispatch thread's
- * wait. Blocks until the earliest message is due, copies it (and those due
- * with the same stamp, up to DISPATCH_MAX bytes) into `buf`, its stamp into
- * meta[0], and returns the byte count; -1 once the output is closed. Being
+ * wait. Blocks until the earliest message is due, copies it (and the whole
+ * messages due with the same stamp, up to DISPATCH_MAX bytes) into `buf`, its
+ * stamp into meta[0], and returns the byte count; -1 once the output is closed. Being
  * back here means the last MidiReceiver.send returned, so this is also where
  * a refusing queue reports that it has drained. */
 JNIEXPORT jint JNICALL Java_io_mob_midi_MobMidiBridge_nativeNextSend(JNIEnv *j, jclass cls, jlong handle,

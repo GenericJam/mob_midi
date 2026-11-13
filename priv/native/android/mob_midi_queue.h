@@ -32,10 +32,16 @@
 /* At or below this many chunks a refusing queue has drained. */
 #define MOB_MIDI_QUEUE_LOW_WATER (MOB_MIDI_QUEUE_CAPACITY / 2)
 
+/* The longest message: the whole queue. Longer ones are refused with
+ * MOB_MIDI_ERR_TOO_LARGE (no refusal state: they could never fit). A take's
+ * buffer must hold this much, since a message is never split across takes. */
+#define MOB_MIDI_QUEUE_MAX_BYTES (MOB_MIDI_QUEUE_CAPACITY * MOB_MIDI_CHUNK_BYTES)
+
 typedef struct {
     int64_t due;       /* when to hand it over */
     int64_t timestamp; /* the stamp it carries */
     uint64_t seq;      /* FIFO among equal `due` */
+    uint16_t msg_len;  /* the whole message's bytes on its first chunk, 0 on the rest */
     uint8_t len;
     uint8_t bytes[MOB_MIDI_CHUNK_BYTES];
 } mob_midi_qmsg;
@@ -86,9 +92,13 @@ static inline void mob_midi_queue_heap_pop(mob_midi_queue *q) {
     if (q->count > 0) q->heap[i] = last;
 }
 
-/* `len` bytes (> 0) stamped and due at `stamp`, split into chunks. MOB_MIDI_OK
- * or MOB_MIDI_ERR_QUEUE_FULL (nothing queued). */
+/* `len` bytes (> 0) stamped and due at `stamp`, split into chunks. MOB_MIDI_OK,
+ * MOB_MIDI_ERR_QUEUE_FULL (nothing queued; refusing from now on) or
+ * MOB_MIDI_ERR_TOO_LARGE (over MOB_MIDI_QUEUE_MAX_BYTES). A message's chunks
+ * share its due time and take consecutive seqs, so they sit together in heap
+ * order: anything due earlier sorts before all of them. */
 static inline int mob_midi_queue_push(mob_midi_queue *q, const uint8_t *bytes, size_t len, int64_t stamp) {
+    if (len > MOB_MIDI_QUEUE_MAX_BYTES) return MOB_MIDI_ERR_TOO_LARGE;
     if (q->refusing) return MOB_MIDI_ERR_QUEUE_FULL;
     size_t chunks = (len + MOB_MIDI_CHUNK_BYTES - 1) / MOB_MIDI_CHUNK_BYTES;
     if ((size_t)q->count + chunks > MOB_MIDI_QUEUE_CAPACITY) {
@@ -98,12 +108,14 @@ static inline int mob_midi_queue_push(mob_midi_queue *q, const uint8_t *bytes, s
     mob_midi_qmsg m;
     m.due = stamp;
     m.timestamp = stamp;
+    m.msg_len = (uint16_t)len;
     for (size_t done = 0; done < len;) {
         size_t n = len - done > MOB_MIDI_CHUNK_BYTES ? MOB_MIDI_CHUNK_BYTES : len - done;
         m.seq = q->seq++;
         m.len = (uint8_t)n;
         memcpy(m.bytes, bytes + done, n);
         mob_midi_queue_heap_push(q, &m);
+        m.msg_len = 0;
         done += n;
     }
     return MOB_MIDI_OK;
@@ -123,18 +135,24 @@ static inline bool mob_midi_queue_drained(mob_midi_queue *q) {
 /* The earliest message's due time; the queue must not be empty. */
 static inline int64_t mob_midi_queue_next_due(const mob_midi_queue *q) { return q->heap[0].due; }
 
-/* Moves the due batch into `out` (the earliest message and those after it
- * with the same stamp, up to `max` bytes), its stamp into *stamp; returns
- * the byte count, 0 when nothing is due at `now`. A batch taken marks the
- * dispatcher as sending until mob_midi_queue_idle(). */
+/* Moves the due batch into `out` (the earliest message and the whole
+ * messages after it with the same stamp, up to `max` bytes; `max` must be
+ * at least MOB_MIDI_QUEUE_MAX_BYTES), its stamp into *stamp; returns the
+ * byte count, 0 when nothing is due at `now`. Messages are taken whole, so
+ * nothing pushed later can land between two parts of one (a long SysEx). A
+ * batch taken marks the dispatcher as sending until mob_midi_queue_idle(). */
 static inline int mob_midi_queue_take(mob_midi_queue *q, int64_t now, uint8_t *out, int max, int64_t *stamp) {
     if (q->count == 0 || q->heap[0].due > now) return 0;
     int n = 0;
     int64_t s = q->heap[0].timestamp;
-    while (q->count > 0 && q->heap[0].timestamp == s && n + q->heap[0].len <= max) {
-        memcpy(out + n, q->heap[0].bytes, q->heap[0].len);
-        n += q->heap[0].len;
-        mob_midi_queue_heap_pop(q);
+    /* The head is always a message's first chunk. */
+    while (q->count > 0 && q->heap[0].timestamp == s && n + q->heap[0].msg_len <= max) {
+        for (int left = q->heap[0].msg_len; left > 0;) {
+            memcpy(out + n, q->heap[0].bytes, q->heap[0].len);
+            n += q->heap[0].len;
+            left -= q->heap[0].len;
+            mob_midi_queue_heap_pop(q);
+        }
     }
     *stamp = s;
     q->sending = n > 0;

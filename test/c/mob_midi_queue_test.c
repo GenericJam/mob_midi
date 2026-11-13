@@ -148,6 +148,35 @@ static void test_chunks_count_against_capacity(void) {
     CHECK(q.count == MOB_MIDI_QUEUE_CAPACITY - 2);
 }
 
+static void test_too_large_is_not_a_refusal(void) {
+    static uint8_t huge[MOB_MIDI_QUEUE_MAX_BYTES + 1];
+    mob_midi_queue_reset(&q);
+    CHECK(mob_midi_queue_push(&q, huge, sizeof huge, 1) == MOB_MIDI_ERR_TOO_LARGE);
+    CHECK(!q.refusing && q.count == 0);
+    /* The whole queue is one message's limit. */
+    CHECK(mob_midi_queue_push(&q, huge, MOB_MIDI_QUEUE_MAX_BYTES, 1) == MOB_MIDI_OK);
+    CHECK(q.count == MOB_MIDI_QUEUE_CAPACITY);
+}
+
+static void test_messages_are_never_split(void) {
+    static uint8_t sysex[2000], out[MOB_MIDI_QUEUE_MAX_BYTES];
+    int64_t stamp = 0;
+    mob_midi_queue_reset(&q);
+    memset(sysex, 0x11, sizeof sysex);
+    sysex[0] = 0xF0;
+    sysex[sizeof sysex - 1] = 0xF7;
+    CHECK(mob_midi_queue_push(&q, sysex, sizeof sysex, 50) == MOB_MIDI_OK);
+    CHECK(mob_midi_queue_push(&q, sysex, sizeof sysex, 50) == MOB_MIDI_OK);
+    /* Two same-stamp messages, room for one and a half: only the first. */
+    CHECK(round_trip(50, out, 3000, &stamp) == 2000);
+    CHECK(out[0] == 0xF0 && out[1999] == 0xF7);
+    /* An earlier-stamped note pushed now goes next, before the second dump, not inside it. */
+    CHECK(push1(0x90, 10) == MOB_MIDI_OK);
+    CHECK(round_trip(50, out, (int)sizeof out, &stamp) == 1 && out[0] == 0x90 && stamp == 10);
+    CHECK(round_trip(50, out, (int)sizeof out, &stamp) == 2000);
+    CHECK(out[0] == 0xF0 && out[1999] == 0xF7);
+}
+
 int main(void) {
     test_order();
     test_long_message();
@@ -155,6 +184,8 @@ int main(void) {
     test_discard();
     test_abandon();
     test_chunks_count_against_capacity();
+    test_too_large_is_not_a_refusal();
+    test_messages_are_never_split();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

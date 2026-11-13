@@ -97,18 +97,20 @@ extern "C" {
 #define MOB_MIDI_MAX_SOURCES 64
 
 /* Per-port send queue: chunks, and bytes per chunk (longer messages take
- * several chunks). */
+ * several chunks). One message may be at most CAPACITY x CHUNK_BYTES
+ * (16 KiB) long and always leaves in one piece. */
 #define MOB_MIDI_QUEUE_CAPACITY 256
 #define MOB_MIDI_CHUNK_BYTES 64
 
 enum {
     MOB_MIDI_OK = 0,
     MOB_MIDI_ERR_NOT_OPEN = -1,    /* no such open output (closed, never opened, stale handle) */
-    MOB_MIDI_ERR_QUEUE_FULL = -2,  /* the port's queue has no room for the message */
+    MOB_MIDI_ERR_QUEUE_FULL = -2,  /* no room for the message, or refusing until drained */
     MOB_MIDI_ERR_NO_LISTENER = -3, /* own virtual output nobody has open */
     MOB_MIDI_ERR_BUSY = -4,        /* a sink is already registered */
     MOB_MIDI_ERR_INVALID = -5,     /* bad argument (NULL bytes, len 0, unknown source) */
-    MOB_MIDI_ERR_UNSUPPORTED = -6  /* platform without the native path (iOS) */
+    MOB_MIDI_ERR_UNSUPPORTED = -6, /* platform without the native path (iOS) */
+    MOB_MIDI_ERR_TOO_LARGE = -7    /* longer than the whole queue; never fits */
 };
 
 /* An output handle (MobMidi.output_handle/2). Always > 0 when valid. */

@@ -175,18 +175,21 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     private const val CORE_NOT_OPEN = -1
     private const val CORE_QUEUE_FULL = -2
     private const val CORE_NO_LISTENER = -3
+    private const val CORE_TOO_LARGE = -7
 
-    // Bytes per MidiReceiver.send from a Dispatcher (DISPATCH_MAX in C).
-    private const val DISPATCH_MAX = 1024
+    // Bytes per MidiReceiver.send from a Dispatcher (DISPATCH_MAX in C): the
+    // whole queue, as a message (up to 16 KiB of SysEx) is never split.
+    private const val DISPATCH_MAX = 256 * 64
 
     // send() result codes; mob_midi_nif.zig maps them to :ok / :queued /
-    // {:error, :not_open | :queue_full | :send_failed | :no_listener}.
+    // {:error, :not_open | :queue_full | :send_failed | :no_listener | :too_large}.
     private const val SEND_OK = 0
     private const val SEND_QUEUED = 1
     private const val SEND_NOT_OPEN = 2
     private const val SEND_QUEUE_FULL = 3
     private const val SEND_FAILED = 4
     private const val SEND_NO_LISTENER = 5
+    private const val SEND_TOO_LARGE = 6
 
     // What may be buffered per port while its output is opening, counted in
     // the C queue's 64-byte chunks (MOB_MIDI_QUEUE_CAPACITY x
@@ -594,9 +597,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
             if (pending != null) {
                 pending.pids.add(pid); return
             }
-            pendingOutputs[k] = PendingOutput(mutableListOf(pid))
+            val created = PendingOutput(mutableListOf(pid))
+            pendingOutputs[k] = created
+            worker.post { startOpenOutput(deviceId, port, created) }
         }
-        worker.post { startOpenOutput(deviceId, port) }
     }
 
     // An output opened again: :opened (and its events) for the new opener,
@@ -612,7 +616,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         nativeDeliverMidiError(pid, deviceId, "open_output", "closed", 0)
     }
 
-    private fun startOpenOutput(deviceId: Int, port: Int) {
+    // Every step works on its own PendingOutput: an open asked for before a
+    // close() never completes (or fails) one asked for after it.
+    private fun startOpenOutput(deviceId: Int, port: Int, pending: PendingOutput) {
+        if (synchronized(sendLock) { pendingOutputs[key(deviceId, port)] !== pending }) return
         val mm = midiManager()
         val info = mm?.let { findDevice(it, deviceId) }
         val failure =
@@ -627,35 +634,40 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                 else -> null
             }
         if (failure != null) {
-            failOutput(deviceId, port, failure)
+            failOutput(deviceId, port, pending, failure)
             return
         }
-        withDevice(mm!!, info!!) { device -> finishOpenOutput(deviceId, port, device) }
+        withDevice(mm!!, info!!) { device -> finishOpenOutput(deviceId, port, device, pending) }
     }
 
     // The open failed before it reached the device: its openers (unless
     // close() cancelled it already) get the error, its queue is dropped.
-    private fun failOutput(deviceId: Int, port: Int, reason: String) {
-        val pending = synchronized(sendLock) { pendingOutputs.remove(key(deviceId, port)) } ?: return
+    private fun failOutput(deviceId: Int, port: Int, pending: PendingOutput, reason: String) {
+        val k = key(deviceId, port)
+        val current = synchronized(sendLock) { pendingOutputs.remove(k, pending) }
+        if (!current) return
         for (pid in pending.pids) nativeDeliverMidiError(pid, deviceId, "open_output", reason, pending.queue.size)
     }
 
-    private fun finishOpenOutput(deviceId: Int, port: Int, device: MidiDevice?) {
+    private fun finishOpenOutput(deviceId: Int, port: Int, device: MidiDevice?, pending: PendingOutput) {
         val k = key(deviceId, port)
         val inputPort = device?.openInputPort(port)
         var failure: String? = null
-        val pending = synchronized(sendLock) {
-            val pending = pendingOutputs.remove(k)
+        // Closed after the lock: MidiInputPort.close is a binder call that can
+        // hang on a wedged service, and sendLock is taken on BEAM schedulers.
+        var unused: MidiInputPort? = null
+        val current = synchronized(sendLock) {
+            val current = pendingOutputs.remove(k, pending)
             when {
                 // close() ran while we were opening: nobody wants this port.
-                pending == null -> closeQuietly(inputPort)
+                !current -> unused = inputPort
                 device == null -> failure = "open_failed"
                 // An input port has one opener at a time: null while another app has it.
                 inputPort == null -> failure = "no_input_port"
                 else -> {
                     val handle = nativeOutputOpen(deviceId, port, false, pending.pids.last())
                     if (handle == 0L) {
-                        closeQuietly(inputPort)
+                        unused = inputPort
                         failure = "no_free_output"
                     } else {
                         // Under the lock, before the slot takes sends, so sends
@@ -667,18 +679,20 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                         }
                         nativeOutputReady(handle, pending.refused)
                         outputs[k] = OpenOutput(inputPort, handle)
-                        Dispatcher(handle, inputPort).start()
                         // Under the lock too: a close() after this point
                         // finds the output, one before it removed `pending`.
                         for (pid in pending.pids) nativeDeliverMidiOpened(pid, deviceId, port, "output", 0, handle)
+                        // After :opened: the Dispatcher is what reports
+                        // :drained (a refusal while opening carries over).
+                        Dispatcher(handle, inputPort).start()
                     }
                 }
             }
-            pending
+            current
         }
-        if (pending == null || failure != null) releaseUnusedDevice(deviceId)
+        closeQuietly(unused)
+        if (!current || failure != null) releaseUnusedDevice(deviceId)
         val reason = failure ?: return
-        if (pending == null) return
         for (pid in pending.pids) nativeDeliverMidiError(pid, deviceId, "open_output", reason, pending.queue.size)
     }
 
@@ -708,6 +722,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                     CORE_QUEUE_FULL -> SEND_QUEUE_FULL
                     CORE_NO_LISTENER -> SEND_NO_LISTENER
                     CORE_NOT_OPEN -> SEND_NOT_OPEN
+                    CORE_TOO_LARGE -> SEND_TOO_LARGE
                     else -> SEND_FAILED
                 }
             } else {
@@ -715,6 +730,8 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                 val need = (bytes.size + CHUNK_BYTES - 1) / CHUNK_BYTES
                 when {
                     pending == null -> SEND_NOT_OPEN
+                    // Could never fit the port's queue (MOB_MIDI_ERR_TOO_LARGE).
+                    need > PENDING_CHUNKS -> SEND_TOO_LARGE
                     pending.refused || pending.chunks + need > PENDING_CHUNKS -> {
                         // Refused until the open port has drained, as in C.
                         pending.refused = true
@@ -825,11 +842,12 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                 for (p in handles.indices) {
                     nativeOutputReady(handles[p], false)
                     nativeOutputListeners(handles[p], status?.getOutputPortOpenCount(p) ?: 0)
-                    Dispatcher(handles[p], VirtualOut(id, p)).start()
                 }
                 nativeDeliverMidiVirtualOpened(pid, id, utf8(name))
                 val (senders, listeners) = counts(status)
                 nativeDeliverMidiVirtualStatus(pid, id, senders, listeners)
+                // After :opened, as their :drained reports come from them.
+                for (p in handles.indices) Dispatcher(handles[p], VirtualOut(id, p)).start()
                 true
             }
         }
