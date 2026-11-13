@@ -60,6 +60,7 @@ import android.media.midi.MidiOutputPort
 import android.media.midi.MidiReceiver
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.Process
@@ -245,6 +246,16 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     private var activityRef: WeakReference<Activity>? = null
     private val main = Handler(Looper.getMainLooper())
 
+    // Device opens, port opens and closes, hot-plug: binder calls into other
+    // apps' MIDI services. A service that never answers (Android can't close
+    // a port while a write to a client that stopped reading is blocked) must
+    // stall this thread, not a BEAM scheduler or the UI thread.
+    private val worker: Handler by lazy {
+        val thread = HandlerThread("mob_midi")
+        thread.start()
+        Handler(thread.looper)
+    }
+
     private val openDevices = ConcurrentHashMap<Int, MidiDevice>()
     private val inputs = ConcurrentHashMap<Long, OpenInput>() // (device, port) -> receive port
 
@@ -288,10 +299,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         if (callbackRegistered) return
         val mm = activity.getSystemService(Context.MIDI_SERVICE) as? MidiManager ?: return
         if (Build.VERSION.SDK_INT >= 33) {
-            mm.registerDeviceCallback(MidiManager.TRANSPORT_MIDI_BYTE_STREAM, { main.post(it) }, deviceCallback)
+            mm.registerDeviceCallback(MidiManager.TRANSPORT_MIDI_BYTE_STREAM, { worker.post(it) }, deviceCallback)
         } else {
             @Suppress("DEPRECATION")
-            mm.registerDeviceCallback(deviceCallback, main)
+            mm.registerDeviceCallback(deviceCallback, worker)
         }
         callbackRegistered = true
     }
@@ -344,9 +355,13 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
     private fun findDevice(mm: MidiManager, id: Int): MidiDeviceInfo? = allDevices(mm).firstOrNull { it.id == id }
 
     // Open the device once and share it between inputs and outputs, so opening
-    // several ports of one device doesn't leak a second MidiDevice.
+    // several ports of one device doesn't leak a second MidiDevice. `cb` runs
+    // on the worker thread either way.
     private fun withDevice(mm: MidiManager, info: MidiDeviceInfo, cb: (MidiDevice?) -> Unit) {
-        openDevices[info.id]?.let { cb(it); return }
+        openDevices[info.id]?.let { device ->
+            worker.post { cb(device) }
+            return
+        }
         mm.openDevice(info, { device ->
             if (device == null) {
                 cb(null)
@@ -355,7 +370,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                 if (prev != null) closeQuietly(device)
                 cb(prev ?: device)
             }
-        }, main)
+        }, worker)
     }
 
     // A virtual device declared by this app (a MobMidiDeviceService subclass in
@@ -489,7 +504,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         val open = inputs.remove(k) ?: return
         // Source first: once it returns, nothing more of this port is delivered.
         nativeSourceClose(open.source)
-        closeQuietly(open.port)
+        closeLater(open.port)
     }
 
     // ── Output ──────────────────────────────────────────────────────────────
@@ -501,6 +516,12 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         }
         val info = findDevice(mm, deviceId) ?: run {
             nativeDeliverMidiError(pid, deviceId, "open_output", "no_such_device", 0); return
+        }
+        // send_raw to an own device's id already means "out of it" (its output
+        // ports, open_virtual): writing into its input ports as a client too
+        // would make (device, port) ambiguous.
+        if (isOwn(info)) {
+            nativeDeliverMidiError(pid, deviceId, "open_output", "own_device", 0); return
         }
         if (port < 0 || port >= info.inputPortCount) {
             nativeDeliverMidiError(pid, deviceId, "open_output", "no_such_port", 0); return
@@ -578,7 +599,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         val inUse = inputs.keys.any { deviceOf(it) == deviceId } ||
             synchronized(sendLock) { outputs.keys.any { deviceOf(it) == deviceId } } ||
             openDevices[deviceId]?.info?.type == MidiDeviceInfo.TYPE_BLUETOOTH
-        if (!inUse) closeQuietly(openDevices.remove(deviceId))
+        if (!inUse) closeLater(openDevices.remove(deviceId))
     }
 
     // midi_send lands here only when C has no open output for (device, port):
@@ -631,10 +652,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         }
         for (o in closed) {
             nativeOutputClose(o.handle)
-            closeQuietly(o.port)
+            closeLater(o.port)
         }
         inputs.keys.filter { deviceOf(it) == deviceId }.forEach { closeInput(it) }
-        closeQuietly(openDevices.remove(deviceId))
+        closeLater(openDevices.remove(deviceId))
         for (pending in cancelled) {
             for (pid in pending.pids) {
                 nativeDeliverMidiError(pid, deviceId, "open_output", "closed", pending.queue.size)
@@ -888,7 +909,7 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
             nativeDeliverMidiConnected(pid, it.info.id, address); return
         }
         val remote = adapter!!.getRemoteDevice(address)
-        main.post {
+        worker.post {
             try {
                 mm.openBluetoothDevice(remote, { device ->
                     if (device == null) {
@@ -899,11 +920,17 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
                         if (prev != null) closeQuietly(device)
                         nativeDeliverMidiConnected(pid, id, address)
                     }
-                }, main)
+                }, worker)
             } catch (e: SecurityException) {
                 nativeDeliverMidiError(pid, 0, "connect_bluetooth", "permission_denied", 0)
             }
         }
+    }
+
+    // Android objects are closed on the worker: closing a port blocks while a
+    // write to it is blocked (see worker).
+    private fun closeLater(c: java.io.Closeable?) {
+        if (c != null) worker.post { closeQuietly(c) }
     }
 
     // close() on ports/devices is declared to throw IOException; never let one

@@ -64,38 +64,38 @@ devices: other apps on the phone see it, play into it (arriving as `{:midi,
 
 On iOS it creates a CoreMIDI source + destination of that name. On Android a
 virtual device is declared in the app's manifest (Android reads its name and
-ports from there, so the plugin can't contribute it), using the plugin's
+ports from the app's own `res/xml`, so a plugin can't contribute a per-app
+one). Generate the declaration, which uses the plugin's
 `io.mob.midi.MobMidiDeviceService`:
 
-```xml
-<!-- android/app/src/main/AndroidManifest.xml, inside <application> -->
-<service android:name="io.mob.midi.MobMidiDeviceService"
-    android:exported="true"
-    android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
-    <intent-filter>
-        <action android:name="android.media.midi.MidiDeviceService" />
-    </intent-filter>
-    <meta-data android:name="android.media.midi.MidiDeviceService"
-        android:resource="@xml/my_synth_midi" />
-</service>
+```sh
+mix mob_midi.gen.virtual_device --name "My Synth" --inputs 1 --outputs 1
+# writes android/app/src/main/res/xml/mob_midi_device.xml and a fenced
+# <service> block in android/app/src/main/AndroidManifest.xml;
+# --check in CI, --remove to take it out; or config :mob_midi, :virtual_device
 ```
 
-```xml
-<!-- android/app/src/main/res/xml/my_synth_midi.xml -->
-<devices>
-    <device name="My Synth" manufacturer="Me" product="My Synth">
-        <input-port name="in" />
-        <output-port name="out" />
-    </device>
-</devices>
-```
-
+`--inputs` are ports other apps send into the app, `--outputs` ports it sends
+out of (Humdinger: `--inputs 0 --outputs 1`; Magpie: `--inputs 1 --outputs 1`).
 Then `MobMidi.open_virtual(socket, "My Synth")`. Android also reports who has
 it open: `{:midi, :virtual_status, %{device: id, senders: n, listeners: n}}`.
 A second device needs its own `<service>`: declare an empty subclass of
 `io.mob.midi.MobMidiDeviceService` in the app. Android starts the service when
 another app opens the device, possibly before the BEAM is up; bytes sent before
-`open_virtual/2` are dropped.
+`open_virtual/3` are dropped.
+
+## Native code (Android): `priv/include/mob_midi.h`
+
+An audio engine in another static NIF of the app can take MIDI without the
+BEAM: open inputs with `deliver: :native` (or `:both`, per port), register a
+sink with `mob_midi_set_sink(fn, ctx)` and get `(source, generation, bytes,
+len, timestamp_ns)` on the MIDI thread; pass an output's `handle` (from
+`:opened` or `MobMidi.output_handle/2`) to it and call `mob_midi_send(handle,
+bytes, len, at_ns)` from its own thread. Sends wait in the port's queue until
+`at_ns` (the BEAM's `send_raw(..., at:)` shares that queue). Include it
+relative to your source: `#include "../deps/mob_midi/priv/include/mob_midi.h"`.
+The header documents thread and lifetime rules;
+`priv/include/mob_midi_parser.h` is a matching header-only stream parser.
 
 ## Bluetooth MIDI devices (Android)
 
