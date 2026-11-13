@@ -36,6 +36,17 @@ queued and `{:error, reason}` when it wasn't (`:not_open`, `:queue_full`,
 `:no_such_device`, `:too_large` for iOS sends over 256 bytes, `:send_failed`), so
 bind the result instead of piping it on as the socket.
 
+**Back-pressure (Android).** Sends join the port's queue and a thread of the
+port's own writes them, so a listener that stops reading never blocks the
+caller. When its queue is full, the send answers `{:error, :queue_full}` and
+the port refuses every send until it has drained (the stuck write returned
+and at most half the queue is left). The process that opened the port then
+gets `{:midi, :drained, %{device: id, port: n, handle: h, generation: g}}`.
+`MobMidi.discard(id, port: n)` drops what is still queued (stale notes the
+listener would otherwise play late) and returns `{:ok, generation}`; the next
+`:drained` carries it. The usual reaction to `:queue_full`: discard, wait for
+`:drained`, send note-offs or all-notes-off, then carry on.
+
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.
 
@@ -92,8 +103,10 @@ sink with `mob_midi_set_sink(fn, ctx)` and get `(source, generation, bytes,
 len, timestamp_ns)` on the MIDI thread; pass an output's `handle` (from
 `:opened` or `MobMidi.output_handle/2`) to it and call `mob_midi_send(handle,
 bytes, len, at_ns)` from its own thread. Sends wait in the port's queue until
-`at_ns` (the BEAM's `send_raw(..., at:)` shares that queue). Include it
-relative to your source: `#include "../deps/mob_midi/priv/include/mob_midi.h"`.
+`at_ns` (the BEAM's `send_raw(..., at:)` shares that queue);
+`mob_midi_discard(handle)` drops what is queued. Include it relative to your
+source: `#include "../deps/mob_midi/priv/include/mob_midi.h"` (a path
+dependency: the dependency's own path).
 The header documents thread and lifetime rules;
 `priv/include/mob_midi_parser.h` is a matching header-only stream parser.
 
@@ -142,8 +155,16 @@ Ports, timestamps, hot-plug and virtual devices were then checked on an Android
 emulator by a host app (FMutate) with a `MobMidiDeviceService` device played by,
 and listening to, a second app; the iOS side of them is compile-checked only.
 
+0.3 was checked on a moto e (Android 10, 32-bit armeabi-v7a)
+and an Android 15 arm64 emulator with a throwaway host app, a static C NIF
+and `tools/MidiProbe.java` as another process: delivery to the BEAM and the C
+sink with the sender's stamps, scheduled sends, `port: :all`, a stalled
+listener through `:queue_full`, `discard/2` and `:drained`, open/close races,
+hot-plug and an emoji device name; numbers in the CHANGELOG.
+
 Not verified: USB-MIDI and BLE-MIDI hardware on either platform (including the
-`MobMidi.Ble` peripheral and `connect_bluetooth/2`).
+`MobMidi.Ble` peripheral and `connect_bluetooth/2`), and the native C path on
+iOS (it has none yet: the `mob_midi.h` functions answer unsupported there).
 
 Activating both mob_midi and mob_bluetooth: both declare
 `NSBluetoothAlwaysUsageDescription`, and mob_dev (0.7.14) refuses the native

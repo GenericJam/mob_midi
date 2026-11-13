@@ -17,13 +17,19 @@
 //!   {:midi, :bluetooth_device, %{address:, name:, rssi:}}            -- nativeDeliverMidiBluetoothDevice
 //!   {:midi, :connected, %{device:, address:}}                        -- nativeDeliverMidiConnected
 //!   {:midi, :error, %{device:, op:, reason:, dropped:}}              -- nativeDeliverMidiError
+//!   {:midi, :drained, %{device:, port:, handle:, generation:}}       -- mob_midi_core.c (nativeNextSend)
 //!
 //! midi_send returns :ok (queued for the port's dispatch thread), :queued
 //! (output still opening; flushed in order when it opens) or {:error,
 //! :not_open | :queue_full | :send_failed | :no_listener}. An open output's
 //! bytes go straight into its queue in mob_midi_core.c (no JNI); only a port
 //! that isn't open yet takes the Kotlin path. Timestamps are CLOCK_MONOTONIC
-//! ns (System.nanoTime), the clock of midi_now_ns/0.
+//! ns (System.nanoTime), the clock of midi_now_ns/0. midi_discard drops an
+//! open output's queue (mob_midi_discard).
+//!
+//! Every call into Kotlin only records the request and posts it to the
+//! bridge's worker thread (MidiManager lookups are binder calls), so no NIF
+//! here blocks on another process; the answers come from that thread.
 //!
 //! mob-core ERTS / JNI bindings come in via the named imports @import("erts")
 //! and @import("jni") that build.zig wires for plugin NIFs.
@@ -37,6 +43,11 @@ extern var g_jvm: ?*jni.JavaVM;
 // mob_midi_core.c (the plugin's android.jni_source): the send queues.
 extern fn mob_midi__send_device(device: i32, port: i32, bytes: [*]const u8, len: usize, at_ns: i64) c_int;
 extern fn mob_midi__output_handle(device: i32, port: i32) i64;
+extern fn mob_midi__discard_device(device: i32, port: i32) c_int;
+// CLOCK_MONOTONIC ns, from mob_midi_core.c. Not mob_zig's nowNs: its
+// Timespec is two i64s, which garbles the result on 32-bit ARM, where
+// time_t and long are 32 bits.
+extern fn mob_midi_now_ns() i64;
 const MOB_MIDI_OK: c_int = 0;
 const MOB_MIDI_ERR_NOT_OPEN: c_int = -1;
 const MOB_MIDI_ERR_QUEUE_FULL: c_int = -2;
@@ -72,10 +83,10 @@ export fn Java_io_mob_midi_MobMidiBridge_nativeRegister(jenv: *jni.JNIEnv, cls: 
     g_midi.open_output = jni.getStaticMethodID(jenv, cls, "openOutput", "(JII)V");
     g_midi.send = jni.getStaticMethodID(jenv, cls, "send", "(II[BJ)I");
     g_midi.close = jni.getStaticMethodID(jenv, cls, "close", "(I)V");
-    g_midi.open_virtual = jni.getStaticMethodID(jenv, cls, "openVirtual", "(JLjava/lang/String;I)V");
+    g_midi.open_virtual = jni.getStaticMethodID(jenv, cls, "openVirtual", "(J[BI)V");
     g_midi.scan_bluetooth = jni.getStaticMethodID(jenv, cls, "scanBluetooth", "(JI)V");
     g_midi.stop_bluetooth_scan = jni.getStaticMethodID(jenv, cls, "stopBluetoothScan", "()V");
-    g_midi.connect_bluetooth = jni.getStaticMethodID(jenv, cls, "connectBluetooth", "(JLjava/lang/String;)V");
+    g_midi.connect_bluetooth = jni.getStaticMethodID(jenv, cls, "connectBluetooth", "(J[B)V");
 }
 
 inline fn detachIfAttached(attached: c_int) void {
@@ -99,18 +110,17 @@ inline fn notLoaded(env: ?*erts.ErlNifEnv) erts.ERL_NIF_TERM {
     return erts.makeTuple(env, .{ erts.atom(env, "error"), erts.atom(env, "nif_not_loaded") });
 }
 
-fn makeBinary(env: ?*erts.ErlNifEnv, data: []const u8) erts.ERL_NIF_TERM {
+// UTF-8 bytes from Kotlin as a binary term (in a message env). Text that
+// carries names comes as byte[], not String: GetStringUTFChars gives
+// modified UTF-8, which turns a character outside the BMP (an emoji in a
+// device name) into surrogate bytes that aren't valid UTF-8.
+fn bytesBinary(env: ?*erts.ErlNifEnv, jenv: *jni.JNIEnv, arr: jni.JByteArray) ?erts.ERL_NIF_TERM {
+    if (arr == null) return null;
+    const len = jni.getArrayLength(jenv, arr);
     var bin: erts.ErlNifBinary = undefined;
-    _ = erts.enif_alloc_binary(data.len, &bin);
-    if (data.len > 0) @memcpy(bin.data[0..data.len], data);
+    if (erts.enif_alloc_binary(@intCast(len), &bin) == 0) return null;
+    if (len > 0) jni.getByteArrayRegion(jenv, arr, 0, len, @ptrCast(bin.data));
     return erts.enif_make_binary(env, &bin);
-}
-
-// A Java string as a binary term (in a message env).
-fn javaStringBinary(env: ?*erts.ErlNifEnv, jenv: *jni.JNIEnv, str: jni.JString) ?erts.ERL_NIF_TERM {
-    const cstr = jni.getStringUTFChars(jenv, str) orelse return null;
-    defer jni.releaseStringUTFChars(jenv, str, cstr);
-    return makeBinary(env, std.mem.span(cstr));
 }
 
 // Never leave a pending Java exception on a BEAM scheduler thread: the next
@@ -197,6 +207,18 @@ export fn nif_midi_output_handle(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]co
     return erts.makeTuple(env, .{ erts.atom(env, "ok"), erts.enif_make_int64(env, handle) });
 }
 
+// midi_discard(device, port): drop the open output's queue; {:ok, generation}.
+export fn nif_midi_discard(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
+    _ = argc;
+    var dev: c_int = 0;
+    var port: c_int = 0;
+    if (erts.enif_get_int(env, argv[0], &dev) == 0 or erts.enif_get_int(env, argv[1], &port) == 0)
+        return erts.badarg(env);
+    const generation = mob_midi__discard_device(dev, port);
+    if (generation <= 0) return erts.errorTuple(env, erts.atom(env, "not_open"));
+    return erts.makeTuple(env, .{ erts.atom(env, "ok"), erts.enif_make_int(env, generation) });
+}
+
 export fn nif_midi_open_output(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
     return callSelfDevicePortVoid(env, g_midi.open_output, argv);
@@ -266,34 +288,33 @@ export fn nif_midi_send(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.
 export fn nif_midi_now_ns(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
     _ = argv;
-    return erts.enif_make_int64(env, jni.nowNs());
+    return erts.enif_make_int64(env, mob_midi_now_ns());
 }
 
-// (pid, String[, Int]) calls: connect_bluetooth(address), open_virtual(name, route).
-fn callSelfString(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, arg: erts.ERL_NIF_TERM, extra: ?c_int) erts.ERL_NIF_TERM {
+// (pid, byte[][, Int]) calls: connect_bluetooth(address), open_virtual(name,
+// route). The binary goes over as UTF-8 bytes: NewStringUTF takes modified
+// UTF-8 and rejects a 4-byte sequence (CheckJNI aborts the app).
+fn callSelfBytes(env: ?*erts.ErlNifEnv, mid: jni.JMethodID, arg: erts.ERL_NIF_TERM, extra: ?c_int) erts.ERL_NIF_TERM {
     if (mid == null) return notLoaded(env);
     var bin: erts.ErlNifBinary = undefined;
     if (erts.enif_inspect_binary(env, arg, &bin) == 0) return erts.badarg(env);
-    var buf: [256]u8 = undefined;
-    if (bin.size >= buf.len) return erts.badarg(env);
-    @memcpy(buf[0..bin.size], bin.data[0..bin.size]);
-    buf[bin.size] = 0;
     var pid: erts.ErlNifPid = undefined;
     _ = erts.enif_self(env, &pid);
     var attached: c_int = 0;
     const jenv = get_jenv(&attached) orelse return erts.atom(env, "error");
     defer detachIfAttached(attached);
-    const jstr = jni.newStringUTF(jenv, @ptrCast(&buf));
-    if (jstr == null) {
-        _ = clearPendingException(jenv);
+    const jarr = jni.newByteArray(jenv, @intCast(bin.size));
+    if (jarr == null) {
+        _ = clearPendingException(jenv); // OutOfMemoryError
         return erts.atom(env, "error");
     }
+    defer jni.deleteLocalRef(jenv, jarr);
+    if (bin.size > 0) jni.setByteArrayRegion(jenv, jarr, 0, @intCast(bin.size), @ptrCast(bin.data));
     if (extra) |x| {
-        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jstr, @as(jni.JInt, x));
+        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jarr, @as(jni.JInt, x));
     } else {
-        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jstr);
+        jenv.*.CallStaticVoidMethod.?(jenv, g_midi_cls, mid, pidToJlong(pid), jarr);
     }
-    jni.deleteLocalRef(jenv, jstr);
     if (clearPendingException(jenv)) return erts.atom(env, "error");
     return erts.ok(env);
 }
@@ -303,12 +324,12 @@ export fn nif_midi_open_virtual(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]con
     _ = argc;
     var route: c_int = 0;
     if (erts.enif_get_int(env, argv[1], &route) == 0) return erts.badarg(env);
-    return callSelfString(env, g_midi.open_virtual, argv[0], route);
+    return callSelfBytes(env, g_midi.open_virtual, argv[0], route);
 }
 
 export fn nif_midi_connect_bluetooth(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
     _ = argc;
-    return callSelfString(env, g_midi.connect_bluetooth, argv[0], null);
+    return callSelfBytes(env, g_midi.connect_bluetooth, argv[0], null);
 }
 
 export fn nif_midi_scan_bluetooth(env: ?*erts.ErlNifEnv, argc: c_int, argv: [*]const erts.ERL_NIF_TERM) callconv(.c) erts.ERL_NIF_TERM {
@@ -346,11 +367,11 @@ fn sendMidi(env: ?*erts.ErlNifEnv, pid_long: jni.JLong, comptime tag: [:0]const 
     _ = erts.enif_send(null, &pid, env, msg);
 }
 
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiDevices(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, json: jni.JString) callconv(.c) void {
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiDevices(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, json: jni.JByteArray) callconv(.c) void {
     _ = cls;
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    const bin_term = javaStringBinary(env, jenv, json) orelse return;
+    const bin_term = bytesBinary(env, jenv, json) orelse return;
     sendMidi(env, pid_long, "devices", bin_term);
 }
 
@@ -378,11 +399,11 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiOpened(jenv: *jni.
     sendMidi(env, pid_long, "opened", map);
 }
 
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiVirtualOpened(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, name: jni.JString) callconv(.c) void {
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiVirtualOpened(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, name: jni.JByteArray) callconv(.c) void {
     _ = cls;
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    const name_term = javaStringBinary(env, jenv, name) orelse return;
+    const name_term = bytesBinary(env, jenv, name) orelse return;
     const map = erts.makeMap(
         env,
         &.{ erts.atom(env, "device"), erts.atom(env, "direction"), erts.atom(env, "name") },
@@ -422,12 +443,12 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiEvent(jenv: *jni.J
     _ = erts.enif_send(null, &pid, env, msg);
 }
 
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, address: jni.JString, name: jni.JString, rssi: jni.JInt) callconv(.c) void {
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, address: jni.JByteArray, name: jni.JByteArray, rssi: jni.JInt) callconv(.c) void {
     _ = cls;
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    const address_term = javaStringBinary(env, jenv, address) orelse return;
-    const name_term = javaStringBinary(env, jenv, name) orelse return;
+    const address_term = bytesBinary(env, jenv, address) orelse return;
+    const name_term = bytesBinary(env, jenv, name) orelse return;
     const map = erts.makeMap(
         env,
         &.{ erts.atom(env, "address"), erts.atom(env, "name"), erts.atom(env, "rssi") },
@@ -436,11 +457,11 @@ pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiBluetoothDevice(je
     sendMidi(env, pid_long, "bluetooth_device", map);
 }
 
-pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiConnected(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, address: jni.JString) callconv(.c) void {
+pub export fn Java_io_mob_midi_MobMidiBridge_nativeDeliverMidiConnected(jenv: *jni.JNIEnv, cls: jni.JClass, pid_long: jni.JLong, device: jni.JInt, address: jni.JByteArray) callconv(.c) void {
     _ = cls;
     const env = erts.enif_alloc_env() orelse return;
     defer erts.enif_free_env(env);
-    const address_term = javaStringBinary(env, jenv, address) orelse return;
+    const address_term = bytesBinary(env, jenv, address) orelse return;
     const map = erts.makeMap(
         env,
         &.{ erts.atom(env, "device"), erts.atom(env, "address") },
@@ -477,6 +498,7 @@ const nif_funcs = [_]erts.ErlNifFunc{
     .{ .name = "midi_now_ns", .arity = 0, .fptr = nif_midi_now_ns, .flags = 0 },
     .{ .name = "midi_open_virtual", .arity = 2, .fptr = nif_midi_open_virtual, .flags = 0 },
     .{ .name = "midi_output_handle", .arity = 2, .fptr = nif_midi_output_handle, .flags = 0 },
+    .{ .name = "midi_discard", .arity = 2, .fptr = nif_midi_discard, .flags = 0 },
     .{ .name = "midi_scan_bluetooth", .arity = 1, .fptr = nif_midi_scan_bluetooth, .flags = 0 },
     .{ .name = "midi_stop_bluetooth_scan", .arity = 0, .fptr = nif_midi_stop_bluetooth_scan, .flags = 0 },
     .{ .name = "midi_connect_bluetooth", .arity = 1, .fptr = nif_midi_connect_bluetooth, .flags = 0 },

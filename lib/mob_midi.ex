@@ -44,8 +44,10 @@ defmodule MobMidi do
                       timestamp: sent_ns, received: received_ns}}
 
   After `close/2` returns, no further bytes of the closed port are sent, not
-  even ones its MIDI thread was already delivering (Android); messages already
-  in the mailbox stay there.
+  even ones its MIDI thread was already delivering (Android), and no
+  `:opened` of an open asked for before the close is still to come (an open
+  still in flight answers `{:midi, :error, %{reason: :closed}}`); messages
+  already in the mailbox stay there.
 
   Parse it with `parse/1` (pure, so it's unit-testable and you decide how much
   to decode):
@@ -93,6 +95,19 @@ defmodule MobMidi do
   queue (ordered by `at:`, at most 256 chunks of 64 bytes), and a thread of
   the port's own writes it, so a receiver that stops reading never blocks the
   caller: its queue fills and sends answer `{:error, :queue_full}`.
+
+  Once a send has answered `{:error, :queue_full}`, the port refuses every
+  send until its queue has drained (the receiver took the write it was stuck
+  in and at most 128 chunks are left). Then the process that opened the port
+  (the last `open_output/3` or `open_virtual/3` caller) gets:
+
+      {:midi, :drained, %{device: id, port: n, handle: h, generation: g}}
+
+  What is still queued at a refusal is usually stale (notes a stalled
+  receiver would play late): `discard/2` drops it and starts a new queue
+  `generation`, which the drained event carries. So an app that sees
+  `:queue_full` can discard, wait for `:drained`, then send what releases
+  the receiver's notes before anything new.
 
   `send_*` return `socket` when the message was queued, and `{:error,
   reason}` when it wasn't: `:not_open` (no `open_output/2` for that device, or
@@ -146,8 +161,9 @@ defmodule MobMidi do
   ## Status: experimental
 
   The native MIDI paths are experimental. Verified against virtual MIDI
-  devices on an Android emulator (`android.media.midi.MidiDeviceService`
-  loopbacks in a test host app) and, for 0.1.2, on the iOS simulator (CoreMIDI
+  devices on an Android emulator and a 32-bit Android phone
+  (`android.media.midi.MidiDeviceService` devices in a test host app, played
+  and listened to by another process) and, for 0.1.2, on the iOS simulator (CoreMIDI
   virtual endpoints). Not verified: USB-MIDI and BLE-MIDI hardware on either
   platform, including `MobMidi.Ble` and `connect_bluetooth/2`. See the
   CHANGELOG for what each release checked.
@@ -330,6 +346,25 @@ defmodule MobMidi do
   def output_handle(device_id, opts \\ []) when is_integer(device_id) do
     if MobMidi.Platform.native_abi?(MobMidi.Platform.current()),
       do: :mob_midi_nif.midi_output_handle(device_id, port(opts)),
+      else: {:error, :unsupported}
+  end
+
+  @doc """
+  Drop everything queued for an open output (Android): `device_id`'s `port:`
+  (default 0), an output of `open_output/3` or of the app's own virtual
+  device. Returns `{:ok, generation}`, the port's new queue generation, which
+  the next `{:midi, :drained, ...}` carries; `{:error, :not_open}` when the
+  port isn't open (yet); `{:error, :unsupported}` elsewhere.
+
+  Meant for a port that answered `{:error, :queue_full}`: what it still
+  holds would reach a stalled receiver late. A port that is refusing sends
+  keeps refusing until it has drained, so wait for `:drained` before sending
+  again. Bytes the port's thread already handed to Android aren't recalled.
+  """
+  @spec discard(device_id(), keyword()) :: {:ok, pos_integer()} | {:error, atom()}
+  def discard(device_id, opts \\ []) when is_integer(device_id) do
+    if MobMidi.Platform.native_abi?(MobMidi.Platform.current()),
+      do: :mob_midi_nif.midi_discard(device_id, port(opts)),
       else: {:error, :unsupported}
   end
 

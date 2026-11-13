@@ -631,6 +631,11 @@ int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len,
   return MOB_MIDI_ERR_UNSUPPORTED;
 }
 
+int mob_midi_discard(mob_midi_port port) {
+  (void)port;
+  return MOB_MIDI_ERR_UNSUPPORTED;
+}
+
 int64_t mob_midi_now_ns(void) { return host_to_ns(mach_absolute_time()); }
 
 ERL_NIF_INIT(mob_midi_nif, nif_funcs, NULL, NULL, NULL, NULL)

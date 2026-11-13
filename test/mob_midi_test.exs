@@ -136,6 +136,13 @@ defmodule MobMidiTest do
       assert [%{type: :other}] = MobMidi.parse_devices(json)
     end
 
+    test "a name outside the BMP arrives intact from the Android UTF-8 payload" do
+      # The bridge sends the JSON as UTF-8 bytes; modified UTF-8 (JNI's
+      # String encoding) would have split the emoji into surrogate bytes.
+      json = ~s([{"id":1,"name":"Keys 🎹","direction":"input"}])
+      assert [%{name: "Keys 🎹"}] = MobMidi.parse_devices(json)
+    end
+
     test "tolerates garbage" do
       assert MobMidi.parse_devices("not json") == []
       assert MobMidi.parse_devices(nil) == []
@@ -259,6 +266,7 @@ defmodule MobMidiTest do
       assert MobMidi.open_virtual(:socket, "Synth") == {:error, :unsupported}
       assert MobMidi.open_virtual(:socket, "Synth", deliver: :both) == {:error, :unsupported}
       assert MobMidi.output_handle(1) == {:error, :unsupported}
+      assert MobMidi.discard(1, port: 1) == {:error, :unsupported}
       assert MobMidi.send_raw(:socket, 1, <<0xF8>>, at: 1) == {:error, :unsupported}
       assert MobMidi.scan_bluetooth(:socket) == {:error, :unsupported}
       assert MobMidi.connect_bluetooth(:socket, "AA:BB") == {:error, :unsupported}

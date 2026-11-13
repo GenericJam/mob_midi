@@ -1,6 +1,7 @@
 // An external MIDI client for checking a mob_midi host app on Android: it
 // runs outside the app, as the adb shell user (app_process), opens the MIDI
-// device whose name is the first argument, listens on every one of its output
+// device whose name is the first argument ("Name*": the first whose name
+// starts with "Name"), listens on every one of its output
 // ports and, by mode, sends notes into its input port 0. Every send is
 // stamped with System.nanoTime (CLOCK_MONOTONIC, MobMidi.now_ns/0's clock),
 // so its lines compare directly with the app's own stamps.
@@ -62,7 +63,7 @@ public final class MidiProbe {
             String name = d.getProperties().getString(MidiDeviceInfo.PROPERTY_NAME);
             say("DEVICE id=" + d.getId() + " name=" + name + " type=" + d.getType()
                     + " in=" + d.getInputPortCount() + " out=" + d.getOutputPortCount());
-            if (info == null && wanted.equals(name)) info = d;
+            if (info == null && matches(wanted, name)) info = d;
         }
         if (mode.equals("devices")) {
             flush();
@@ -130,6 +131,12 @@ public final class MidiProbe {
         say("DONE");
         flush();
         System.exit(0);
+    }
+
+    // "Name*" matches by prefix: a name the shell can't carry (an emoji).
+    private static boolean matches(String wanted, String name) {
+        if (name == null) return false;
+        return wanted.endsWith("*") ? name.startsWith(wanted.substring(0, wanted.length() - 1)) : wanted.equals(name);
     }
 
     // Each pair: 90 nn [F8] 64, then (running status) nn 00, gap ms apart.

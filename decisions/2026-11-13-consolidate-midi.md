@@ -92,7 +92,14 @@ caller's job (Magpie keeps its frame→`CLOCK_MONOTONIC` mapping).
   so a stale handle answers `MOB_MIDI_ERR_NOT_OPEN`.
 - One dispatcher per output keeps Humdinger's property: a listener that
   stops reading blocks its own queue (sends then answer `queue_full`), never
-  the BEAM or other ports.
+  the BEAM or other ports. Humdinger's overflow rule comes with it (round 3):
+  after one refusal the port refuses until it has drained (the dispatcher is
+  back from the stuck write and at most half the queue is left), then its
+  opener gets `{:midi, :drained, %{device, port, handle, generation}}`;
+  `MobMidi.discard/2` / `mob_midi_discard` drop the stale queue and start a
+  new generation. Unlike Humdinger, the queue isn't dropped on overflow by
+  itself: scheduled (`at:`) messages may fill it legitimately, so dropping is
+  the app's call.
 - A header-only stream parser (`mob_midi_parser.h`) with Magpie's rules
   (running status, real-time interleave, SysEx skipped) for native users.
 - iOS: the functions exist and answer `MOB_MIDI_ERR_UNSUPPORTED`; Elixir
@@ -148,9 +155,10 @@ the target time instead of Kotlin).
 drops `:humdinger_midi_port`. `Humdinger.Output.Port`: `open_virtual(socket,
 "Humdinger")` from its owner process, `send_raw(socket, own_id, bytes)` (or
 `at:`), `{:midi, :virtual_status, %{listeners: n}}` replaces `connections`;
-`{:error, :queue_full}` replaces its overflow answer (its "drained" sentinel
-has no equivalent: release held notes on `queue_full` and retry on the next
-`virtual_status`). `Humdinger.Output.Device`: `list_devices` (+ `address`,
+`{:error, :queue_full}` replaces its overflow answer and `{:midi, :drained,
+%{generation: g}}` its "drained" port event (call `MobMidi.discard/2` on
+`queue_full` to drop what is queued, as its writer did, then release held notes
+and panic on `:drained`). `Humdinger.Output.Device`: `list_devices` (+ `address`,
 `type`, `input_ports`/`output_ports`, `own`), `{:midi, :device_added |
 :device_removed, nil}` then re-list, `scan_bluetooth/2`, `connect_bluetooth/2`,
 `close/2`; the BLE recall stays in Humdinger.

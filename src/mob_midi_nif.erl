@@ -21,6 +21,7 @@
     midi_now_ns/0,
     midi_open_virtual/2,
     midi_output_handle/2,
+    midi_discard/2,
     midi_scan_bluetooth/1,
     midi_stop_bluetooth_scan/0,
     midi_connect_bluetooth/1
@@ -58,6 +59,11 @@ midi_open_virtual(_Name, _Route) ->
 %% {ok, Handle} for an open output (mob_midi.h mob_midi_port), or
 %% {error, not_open}.
 midi_output_handle(_DeviceId, _Port) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% {ok, Generation} after dropping an open output's queue (mob_midi_discard),
+%% or {error, not_open}. Android only; MobMidi gates it.
+midi_discard(_DeviceId, _Port) ->
     erlang:nif_error(nif_not_loaded).
 
 %% Android only (iOS pairs BLE-MIDI through its own UI); MobMidi gates it.

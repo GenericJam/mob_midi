@@ -66,7 +66,15 @@
  * order, FIFO for equal stamps. The queue holds MOB_MIDI_QUEUE_CAPACITY
  * chunks of up to MOB_MIDI_CHUNK_BYTES bytes per port; a stalled receiver
  * fills it and further sends answer MOB_MIDI_ERR_QUEUE_FULL rather than
- * block. The BEAM's MobMidi.send_raw/4 shares the same queue. Callable from
+ * block. Once a send has been refused, every send to the port is refused
+ * until the queue has DRAINED: the dispatch thread is back from the send it
+ * was stuck in and at most MOB_MIDI_QUEUE_CAPACITY / 2 chunks are left. The
+ * port's opener then gets {:midi, :drained, %{device, port, handle,
+ * generation}}; native code sees sends succeed again. mob_midi_discard drops
+ * what is queued (stale notes a stalled receiver would get late) and starts
+ * a new queue generation, which the drained event reports; bytes already
+ * handed to Android can't be recalled. The BEAM's MobMidi.send_raw/4 and
+ * MobMidi.discard/2 share the same queue. Callable from
  * any thread; it takes the port's mutex briefly, so call it from your own
  * sender thread, not an audio render callback.
  */
@@ -126,6 +134,11 @@ int mob_midi_source_info(uint32_t source, uint32_t *generation, int32_t *device,
 /* Queue `len` bytes for output `port` at CLOCK_MONOTONIC `at_ns` (<= 0: now).
  * MOB_MIDI_OK, or a negative MOB_MIDI_ERR_*. */
 int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len, int64_t at_ns);
+
+/* Drop everything queued for output `port`: the new queue generation (> 0),
+ * or MOB_MIDI_ERR_NOT_OPEN. A port refusing sends keeps refusing until it
+ * has drained (the drained event carries this generation). */
+int mob_midi_discard(mob_midi_port port);
 
 /* CLOCK_MONOTONIC in ns. */
 int64_t mob_midi_now_ns(void);

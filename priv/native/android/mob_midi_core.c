@@ -30,6 +30,7 @@
 #include "erl_nif.h"
 
 #include "../../include/mob_midi.h"
+#include "mob_midi_queue.h"
 
 #define ROUTE_BEAM 1u
 #define ROUTE_NATIVE 2u
@@ -294,27 +295,18 @@ JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeReceive(JNIEnv *j, j
 
 /* ── Outputs ───────────────────────────────────────────────────────────── */
 
-typedef struct {
-    int64_t due;       /* when to hand it over */
-    int64_t timestamp; /* the stamp it carries */
-    uint64_t seq;      /* FIFO among equal `due` */
-    uint8_t len;
-    uint8_t bytes[MOB_MIDI_CHUNK_BYTES];
-} out_msg;
-
 enum { OUT_FREE = 0, OUT_OPENING, OUT_OPEN };
 
 typedef struct {
     pthread_mutex_t lock;
-    pthread_cond_t cond; /* CLOCK_MONOTONIC: new message, or closed */
+    pthread_cond_t cond; /* CLOCK_MONOTONIC: new message, discard, or closed */
     int state;
-    uint32_t generation;
+    uint32_t generation; /* the handle's, not the queue's */
     int32_t device, port;
     bool virtual_port; /* the app's own device: listeners gate sends */
     int listeners;
-    uint64_t seq;
-    int count;
-    out_msg heap[MOB_MIDI_QUEUE_CAPACITY]; /* min-heap by (due, seq) */
+    int64_t pid; /* the last opener: gets {:midi, :drained, ...} (0: nobody) */
+    mob_midi_queue q;
 } out_slot;
 
 /* Allocated once, on the first output: a static table would put ~700 KB in
@@ -362,55 +354,12 @@ static out_slot *lock_handle(mob_midi_port handle) {
     return o;
 }
 
-static inline bool before(const out_msg *a, const out_msg *b) {
-    return a->due < b->due || (a->due == b->due && a->seq < b->seq);
-}
-
-static void heap_push(out_slot *o, const out_msg *m) {
-    int i = o->count++;
-    while (i > 0) {
-        int parent = (i - 1) / 2;
-        if (!before(m, &o->heap[parent])) break;
-        o->heap[i] = o->heap[parent];
-        i = parent;
-    }
-    o->heap[i] = *m;
-}
-
-static void heap_pop(out_slot *o) {
-    out_msg last = o->heap[--o->count];
-    int i = 0;
-    for (;;) {
-        int child = 2 * i + 1;
-        if (child >= o->count) break;
-        if (child + 1 < o->count && before(&o->heap[child + 1], &o->heap[child])) child++;
-        if (!before(&o->heap[child], &last)) break;
-        o->heap[i] = o->heap[child];
-        i = child;
-    }
-    if (o->count > 0) o->heap[i] = last;
-}
-
 /* Under the slot's lock. */
 static int enqueue_locked(out_slot *o, const uint8_t *bytes, size_t len, int64_t at_ns) {
     if (o->virtual_port && o->listeners <= 0) return MOB_MIDI_ERR_NO_LISTENER;
-    size_t chunks = (len + MOB_MIDI_CHUNK_BYTES - 1) / MOB_MIDI_CHUNK_BYTES;
-    if ((size_t)o->count + chunks > MOB_MIDI_QUEUE_CAPACITY) return MOB_MIDI_ERR_QUEUE_FULL;
-    int64_t now = mob_midi_now_ns();
-    int64_t stamp = at_ns > 0 ? at_ns : now;
-    out_msg m;
-    m.due = stamp;
-    m.timestamp = stamp;
-    for (size_t done = 0; done < len;) {
-        size_t n = len - done > MOB_MIDI_CHUNK_BYTES ? MOB_MIDI_CHUNK_BYTES : len - done;
-        m.seq = o->seq++;
-        m.len = (uint8_t)n;
-        memcpy(m.bytes, bytes + done, n);
-        heap_push(o, &m);
-        done += n;
-    }
-    pthread_cond_signal(&o->cond);
-    return MOB_MIDI_OK;
+    int rc = mob_midi_queue_push(&o->q, bytes, len, at_ns > 0 ? at_ns : mob_midi_now_ns());
+    if (rc == MOB_MIDI_OK) pthread_cond_signal(&o->cond);
+    return rc;
 }
 
 int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len, int64_t at_ns) {
@@ -418,6 +367,19 @@ int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len, int64_t 
     out_slot *o = lock_handle(port);
     if (!o) return MOB_MIDI_ERR_NOT_OPEN;
     int rc = o->state == OUT_OPEN ? enqueue_locked(o, bytes, len, at_ns) : MOB_MIDI_ERR_NOT_OPEN;
+    pthread_mutex_unlock(&o->lock);
+    return rc;
+}
+
+int mob_midi_discard(mob_midi_port port) {
+    out_slot *o = lock_handle(port);
+    if (!o) return MOB_MIDI_ERR_NOT_OPEN;
+    int rc = MOB_MIDI_ERR_NOT_OPEN;
+    if (o->state == OUT_OPEN) {
+        rc = (int)mob_midi_queue_discard(&o->q);
+        /* A dispatcher waiting on the old head re-checks: it may have drained. */
+        pthread_cond_signal(&o->cond);
+    }
     pthread_mutex_unlock(&o->lock);
     return rc;
 }
@@ -444,12 +406,18 @@ int mob_midi__send_device(int32_t device, int32_t port, const uint8_t *bytes, si
     return h ? mob_midi_send(h, bytes, len, at_ns) : MOB_MIDI_ERR_NOT_OPEN;
 }
 
-/* MobMidiBridge.nativeOutputOpen(device, port, virtual): a slot for a port
- * Kotlin is opening, as its handle (0: all taken). Sends to it answer
+/* midi_discard NIF: the new queue generation, or MOB_MIDI_ERR_NOT_OPEN. */
+int mob_midi__discard_device(int32_t device, int32_t port) {
+    mob_midi_port h = mob_midi__output_handle(device, port);
+    return h ? mob_midi_discard(h) : MOB_MIDI_ERR_NOT_OPEN;
+}
+
+/* MobMidiBridge.nativeOutputOpen(device, port, virtual, pid): a slot for a
+ * port Kotlin is opening, as its handle (0: all taken). Sends to it answer
  * NOT_OPEN until nativeOutputReady; Kotlin's own queue is flushed into it
  * with nativeEnqueue first, keeping the order. */
 JNIEXPORT jlong JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputOpen(JNIEnv *j, jclass cls, jint device, jint port,
-                                                                        jboolean virtual_port) {
+                                                                        jboolean virtual_port, jlong pid) {
     (void)j;
     (void)cls;
     if (!ensure_outputs()) return 0;
@@ -466,7 +434,8 @@ JNIEXPORT jlong JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputOpen(JNIEnv *
             o->port = port;
             o->virtual_port = virtual_port;
             o->listeners = 0;
-            o->count = 0;
+            o->pid = pid;
+            mob_midi_queue_reset(&o->q);
             handle = make_handle(i, o->generation);
         }
         pthread_mutex_unlock(&o->lock);
@@ -475,12 +444,29 @@ JNIEXPORT jlong JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputOpen(JNIEnv *
     return handle;
 }
 
-JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputReady(JNIEnv *j, jclass cls, jlong handle) {
+/* Sends are accepted from now on. `refused`: Kotlin's queue refused a send
+ * while the port was opening, so this queue starts out refusing and its
+ * opener hears {:midi, :drained, ...} once it has room. */
+JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputReady(JNIEnv *j, jclass cls, jlong handle,
+                                                                        jboolean refused) {
     (void)j;
     (void)cls;
     out_slot *o = lock_handle(handle);
     if (!o) return;
     o->state = OUT_OPEN;
+    if (refused) o->q.refusing = true;
+    pthread_cond_signal(&o->cond);
+    pthread_mutex_unlock(&o->lock);
+}
+
+/* A later opener of the same output takes over its events. */
+JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputOwner(JNIEnv *j, jclass cls, jlong handle,
+                                                                        jlong pid) {
+    (void)j;
+    (void)cls;
+    out_slot *o = lock_handle(handle);
+    if (!o) return;
+    o->pid = pid;
     pthread_mutex_unlock(&o->lock);
 }
 
@@ -493,8 +479,9 @@ JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputClose(JNIEnv *
     out_slot *o = lock_handle(handle);
     if (o) {
         o->state = OUT_FREE;
-        o->count = 0;
         o->generation = 0;
+        o->pid = 0;
+        mob_midi_queue_reset(&o->q);
         pthread_cond_broadcast(&o->cond);
         pthread_mutex_unlock(&o->lock);
     }
@@ -509,8 +496,8 @@ JNIEXPORT void JNICALL Java_io_mob_midi_MobMidiBridge_nativeOutputListeners(JNIE
     out_slot *o = lock_handle(handle);
     if (!o) return;
     o->listeners = listeners;
-    /* Nobody to hear what is queued. */
-    if (listeners <= 0) o->count = 0;
+    /* Nobody to hear what is queued, nothing to drain into. */
+    if (listeners <= 0) mob_midi_queue_abandon(&o->q);
     pthread_mutex_unlock(&o->lock);
 }
 
@@ -535,10 +522,30 @@ JNIEXPORT jint JNICALL Java_io_mob_midi_MobMidiBridge_nativeEnqueue(JNIEnv *j, j
     return rc;
 }
 
+/* {:midi, :drained, %{device, port, handle, generation}} to the opener.
+ * From the dispatch thread (not an ERTS thread), under the slot's lock. */
+static void deliver_drained(const out_slot *o, mob_midi_port handle) {
+    if (o->pid == 0) return;
+    ErlNifEnv *env = enif_alloc_env();
+    if (!env) return;
+    ERL_NIF_TERM keys[4] = {atom(env, "device"), atom(env, "port"), atom(env, "handle"), atom(env, "generation")};
+    ERL_NIF_TERM vals[4] = {enif_make_int(env, o->device), enif_make_int(env, o->port), enif_make_int64(env, handle),
+                            enif_make_uint(env, o->q.generation)};
+    ERL_NIF_TERM map;
+    if (enif_make_map_from_arrays(env, keys, vals, 4, &map)) {
+        ErlNifPid pid;
+        pid.pid = (ERL_NIF_TERM)o->pid;
+        enif_send(NULL, &pid, env, enif_make_tuple3(env, atom(env, "midi"), atom(env, "drained"), map));
+    }
+    enif_free_env(env);
+}
+
 /* MobMidiBridge.nativeNextSend(handle, buf, meta): the dispatch thread's
  * wait. Blocks until the earliest message is due, copies it (and those due
  * with the same stamp, up to DISPATCH_MAX bytes) into `buf`, its stamp into
- * meta[0], and returns the byte count; -1 once the output is closed. */
+ * meta[0], and returns the byte count; -1 once the output is closed. Being
+ * back here means the last MidiReceiver.send returned, so this is also where
+ * a refusing queue reports that it has drained. */
 JNIEXPORT jint JNICALL Java_io_mob_midi_MobMidiBridge_nativeNextSend(JNIEnv *j, jclass cls, jlong handle,
                                                                      jbyteArray buf, jlongArray meta) {
     (void)cls;
@@ -547,27 +554,25 @@ JNIEXPORT jint JNICALL Java_io_mob_midi_MobMidiBridge_nativeNextSend(JNIEnv *j, 
     int64_t stamp = 0;
     out_slot *o = lock_handle(handle);
     if (!o) return -1;
+    mob_midi_queue_idle(&o->q);
     for (;;) {
         if (o->state == OUT_FREE || o->generation != (uint32_t)(handle >> 32)) {
             pthread_mutex_unlock(&o->lock);
             return -1;
         }
-        if (o->count == 0) {
+        if (o->state == OUT_OPEN && mob_midi_queue_drained(&o->q)) deliver_drained(o, handle);
+        if (o->q.count == 0) {
             pthread_cond_wait(&o->cond, &o->lock);
             continue;
         }
-        int64_t due = o->heap[0].due;
-        if (due > mob_midi_now_ns()) {
+        int64_t now = mob_midi_now_ns();
+        int64_t due = mob_midi_queue_next_due(&o->q);
+        if (due > now) {
             struct timespec until = {.tv_sec = due / 1000000000LL, .tv_nsec = due % 1000000000LL};
             pthread_cond_timedwait(&o->cond, &o->lock, &until);
             continue;
         }
-        stamp = o->heap[0].timestamp;
-        while (o->count > 0 && o->heap[0].timestamp == stamp && n + o->heap[0].len <= DISPATCH_MAX) {
-            memcpy(out + n, o->heap[0].bytes, o->heap[0].len);
-            n += o->heap[0].len;
-            heap_pop(o);
-        }
+        n = mob_midi_queue_take(&o->q, now, out, DISPATCH_MAX, &stamp);
         break;
     }
     pthread_mutex_unlock(&o->lock);
