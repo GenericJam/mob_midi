@@ -103,7 +103,7 @@ home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
 - A host C NIF includes `"../deps/mob_midi/priv/include/mob_midi.h"` (a path
   dependency: include from that path).
 
-### Verified (this branch, moto e, Android 10, armeabi-v7a, throwaway mob.new 0.6.19 host)
+### Verified (this branch at 53bb2bf, moto e, Android 10, armeabi-v7a, throwaway mob.new 0.6.19 host)
 - `dumpsys midi`: hosted device `MobMidiProbe 🎹`, `mInputPortCount=1,
   mOutputPortCount=2`, service `io.mob.midi.MobMidiDeviceService`; the app's
   `primaryCpuAbi=armeabi-v7a`. The emoji name came back intact from
@@ -111,29 +111,53 @@ home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
   the device by it; `connect_bluetooth("🎹:00:00")` answered `:bad_address`
   and `open_virtual("Nope 🎸")` `:no_such_device`, app alive.
 - Probe → hosted input port (100 note pairs, 200 packets, running status +
-  `0xF8` inside messages): 200/200 to the BEAM and 200/200 to the C sink,
-  stamps identical to the probe's `SENT` lines; Elixir and C parsers each 100
-  note-on, 100 note-off, 100 clock; `mob_midi_source_info` from the sink
-  matched every call. Sender → bridge p50 1.29 ms, p95 1.75 ms; → BEAM
-  process p50 2.31 ms, p95 2.73 ms; → sink p50 1.32 ms, p95 1.83 ms.
+  `0xF8` inside messages): 200/200 to the BEAM, stamps identical to the
+  probe's `SENT` lines, 100 note-on / 100 note-off / 100 clock; sender →
+  bridge p50 1.24 ms, p95 1.60 ms; → BEAM process p50 1.93 ms, p95 2.85 ms.
+  The C sink (same receive path, run on the build before the last Kotlin
+  change): 200/200, stamps identical, the C parser 100 / 100 / 100,
+  `mob_midi_source_info` matched every call, → sink p50 1.12 ms, p95 1.38 ms.
 - Scheduled sends, ~400 ms ahead, 50 ms apart: 20 `send_raw at:` (port 0) and
   20 `mob_midi_send` from a pthread (port 1): 40/40 at the probe stamped
-  exactly with the target, in order; arrival − target p50 2.04 / 1.79 ms,
-  p95 3.35 / 4.00 ms, max 4.00 ms.
-- `port: :all` on the app's own 2-port device (`deliver: :both`): sources 2
-  and 3, 10 messages per port to both the BEAM and the sink, by port.
+  exactly with the target, in order; arrival − target p50 2.18 / 2.01 ms,
+  p95 4.48 / 3.67 ms.
+- Message size: `mob_midi_send` of 16384 bytes into an empty queue accepted
+  and delivered whole (17 packets: 16 × 1015 + 144 bytes, all stamped with
+  the target; the last 120 ms after it); 16385 bytes → `MOB_MIDI_ERR_TOO_LARGE`
+  / `{:error, :too_large}`. An 8 KiB SysEx due at T and, while it was being
+  written, a 3-byte send stamped T − 10 ms: the SysEx arrived whole, the
+  note after it.
+- A 16 KiB send behind one note scheduled 300 ms ahead: `:queue_full`; a
+  small send still refused; no `:drained` within 100 ms; one `:drained`
+  3.9 ms after the note's target time; the 16 KiB resend accepted and
+  delivered whole. (Before this fix `:drained` came 0.5 ms after the
+  refusal, while the message still couldn't fit.)
+- `port: :all` on the app's own 2-port device (`deliver: :both`): two
+  sources, 10 messages per port to both the BEAM and the sink, by port.
 - Stalled listener (the probe blocks in its first `onSend`): 624 sends
   accepted, then `:queue_full`; `mob_midi_send` from C then answered
-  `MOB_MIDI_ERR_QUEUE_FULL` too; `discard/2` → `{:ok, 10}`, a send after it
-  still `:queue_full` (refusing); `{:midi, :drained, %{generation: 11, ...}}`
-  48.6 ms after the probe read again (50 ms polling), 7.65 s after the
-  refusal; the next send accepted.
+  `MOB_MIDI_ERR_QUEUE_FULL` too; `discard/2` → `{:ok, g}`, a send after it
+  still `:queue_full`; `:drained` 43.7 ms after the probe read again (50 ms
+  polling), 8.40 s after the refusal; the next send accepted. In 2 of 5 such
+  runs the dispatch thread came back from Android's write about 0.6 ms after
+  the refusal although the probe was still stalled (462 / 516 sends accepted
+  instead of 624), so `:drained` followed the discard at once; cause not
+  found.
+- A refusing own virtual output (256 notes scheduled 20 s ahead) whose only
+  listener left: `:drained` with a new generation within 1 ms, then
+  `:no_listener`. A listener killed while stalled: the queue is dropped but
+  no `:drained` (the dispatch thread's write stays blocked; see the known
+  limit on dead clients).
 - Open/close races, 120 rounds of `open_input(port: :all)` + `open_output` on
-  Magpie's device closed 0–300 ms later: 102 input and 75 output `:opened`,
-  all before `close/2` returned; 18 + 17 opens cancelled with `:closed`, 28
-  `:open_failed` (Android's `openDevice` answering null while the previous
-  round's connection to Magpie's service was closing); no `:opened` after a
-  `close/2`.
+  Magpie's device closed 0–300 ms later, twice (the second after `am
+  force-stop` of Magpie, so its service cold-started): 105 / 107 input and
+  102 / 104 output `:opened`, all before `close/2` returned; 33 + 29 opens
+  cancelled with `:closed`; no `:open_failed`; no `:opened` after a
+  `close/2`; `system_server` stayed up. Before the one-open-in-flight fix the
+  same loop crashed `system_server` once, 14 s after Magpie's service process
+  started (`ConcurrentModificationException` in
+  `MidiService$Device.setDeviceServer`), and an earlier run had 28
+  `:open_failed`.
 - Hot-plug: `pm disable-user` / `pm enable` of Magpie → `:device_removed` /
   `:device_added` to the `list_devices` caller, re-list without / with it.
 
