@@ -52,9 +52,12 @@ home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
   the BEAM never blocks on it.
 - Port and device opens/closes run on a `mob_midi` worker thread, not the BEAM
   scheduler or the UI thread. So do the `MidiManager` lookups behind
-  `list_devices`, `open_input`, `open_output`, `open_virtual` and the
-  Bluetooth calls (binder calls): the NIFs only post the request, and every
-  answer is sent from that thread.
+  `list_devices`, `open_input`, `open_output`, `open_virtual`, and the
+  Bluetooth adapter checks of `scan_bluetooth` / `connect_bluetooth` (binder
+  calls): the NIFs only post the request, and the answers come from that
+  thread (a BLE scan itself still starts and stops on the main thread, where
+  Android delivers its results; `stop_bluetooth_scan` queues behind a pending
+  `scan_bluetooth`).
 - `close/2` racing an open still in flight: once `close/2` returns, no
   `:opened` of an open asked for before it can arrive (it answers `{:midi,
   :error, %{reason: :closed}}`); `:opened` is sent under the same lock

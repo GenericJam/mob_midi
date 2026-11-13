@@ -930,7 +930,10 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         worker.post { checkScan(pid, durationMs) }
     }
 
-    // Adapter state is a binder call: on the worker.
+    // Adapter state is a binder call: checked on the worker. The scan itself
+    // starts and stops on the main thread, where BluetoothLeScanner delivers
+    // its callbacks (scanCallback / scanSeen live there); the Bluetooth
+    // service is the system's, not another app's MIDI service.
     private fun checkScan(pid: Long, durationMs: Int) {
         val activity = activityRef?.get() ?: run {
             nativeDeliverMidiError(pid, 0, "scan_bluetooth", "no_activity", 0); return
@@ -988,9 +991,11 @@ object MobMidiBridge : io.mob.plugin.MobActivityAware, io.mob.plugin.MobPermissi
         main.postDelayed({ if (scanCallback === cb) stopScan() }, durationMs.toLong())
     }
 
+    // Through the worker, behind any scanBluetooth still being checked there,
+    // so a stop right after a scan stops it rather than running first.
     @JvmStatic
     fun stopBluetoothScan() {
-        main.post { stopScan() }
+        worker.post { main.post { stopScan() } }
     }
 
     @Suppress("MissingPermission")
