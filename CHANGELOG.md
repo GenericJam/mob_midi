@@ -8,6 +8,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-13
+
 Consolidation (stacked on the entries below, from #5): mob_midi becomes the one
 home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
 `magpie_midi` plugins can be deleted. Design: `decisions/2026-11-13-consolidate-midi.md`.
