@@ -17,26 +17,35 @@
   ],
   # Runtime permission capability (Android): MobMidiBridge, a
   # MobPermissionProvider, maps :midi_bluetooth to what MobMidi.scan_bluetooth/2
-  # and connect_bluetooth/2 need (BLUETOOTH_SCAN + BLUETOOTH_CONNECT on 12+,
-  # ACCESS_FINE_LOCATION before), so Mob.Permissions.request(socket,
+  # and connect_bluetooth/2 need (BLUETOOTH_SCAN + BLUETOOTH_CONNECT + location
+  # on 12+, ACCESS_FINE_LOCATION before), so Mob.Permissions.request(socket,
   # :midi_bluetooth) shows the dialog.
   permissions: [
     %{capability: :midi_bluetooth}
   ],
   android: %{
-    # USB-MIDI needs no permission. BLE-MIDI scanning gates on the Android 12+
-    # Nearby-devices group (request :midi_bluetooth before scanning for
-    # wireless controllers).
+    # USB-MIDI needs no permission. BLE-MIDI: API <= 30 needs BLUETOOTH /
+    # BLUETOOTH_ADMIN (install-time) and fine location for scans; API 31+ the
+    # Nearby-devices permissions plus location, as mob_dev can't mark
+    # BLUETOOTH_SCAN neverForLocation. Requested at runtime as :midi_bluetooth.
     permissions: [
+      "android.permission.BLUETOOTH",
+      "android.permission.BLUETOOTH_ADMIN",
       "android.permission.BLUETOOTH_CONNECT",
-      "android.permission.BLUETOOTH_SCAN"
+      "android.permission.BLUETOOTH_SCAN",
+      "android.permission.ACCESS_FINE_LOCATION",
+      "android.permission.ACCESS_COARSE_LOCATION"
     ],
     # Also holds MobMidiDeviceService, the class a host's manifest names for
     # its own virtual MIDI devices (MobMidi.open_virtual/2; README "Virtual
     # devices"): the device's name is the host's, so the <service> and its
     # res/xml device info are the host's to declare.
     bridge_kt: "priv/native/android/MobMidiBridge.kt",
-    bridge_class: "io.mob.midi.MobMidiBridge"
+    bridge_class: "io.mob.midi.MobMidiBridge",
+    # The byte paths in C (sources, the native sink, the per-output send
+    # queues): the functions of priv/include/mob_midi.h, linked into the app
+    # library so another static NIF of the app can call them.
+    jni_source: "priv/native/android/mob_midi_core.c"
   },
   ios: %{
     frameworks: ["CoreMIDI"],

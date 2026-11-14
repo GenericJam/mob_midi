@@ -412,6 +412,11 @@ static ERL_NIF_TERM nif_open_input(ErlNifEnv *env, int argc,
     midi_send_error(env, &g_input_pid, (SInt32)uid, "open_input", "no_such_device");
     return enif_make_atom(env, "ok");
   }
+  // -1 (port: :all): a CoreMIDI endpoint is one port. The third argument
+  // (deliver: route) is always 1 (BEAM) here: MobMidi refuses the native sink
+  // on iOS before calling.
+  if (port == -1)
+    port = 0;
   if (port != 0) {
     midi_send_error(env, &g_input_pid, (SInt32)uid, "open_input", "no_such_port");
     return enif_make_atom(env, "ok");
@@ -521,8 +526,9 @@ static ERL_NIF_TERM nif_now_ns(ErlNifEnv *env, int argc,
   return enif_make_int64(env, host_to_ns(mach_absolute_time()));
 }
 
-// open_virtual(name): create (once) a source + destination of that name and
-// make the caller their subscriber.
+// open_virtual(name, route): create (once) a source + destination of that
+// name and make the caller their subscriber (route is always 1, see
+// nif_open_input).
 static ERL_NIF_TERM nif_open_virtual(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]) {
   (void)argc;
@@ -585,12 +591,51 @@ static ERL_NIF_TERM nif_open_virtual(ErlNifEnv *env, int argc,
 // they aren't registered here.
 static ErlNifFunc nif_funcs[] = {
     {"midi_list_devices", 0, nif_list_devices, 0},
-    {"midi_open_input", 2, nif_open_input, 0},
+    {"midi_open_input", 3, nif_open_input, 0},
     {"midi_open_output", 2, nif_open_output, 0},
     {"midi_close", 1, nif_close, 0},
     {"midi_send", 4, nif_send, 0},
     {"midi_now_ns", 0, nif_now_ns, 0},
-    {"midi_open_virtual", 1, nif_open_virtual, 0},
+    {"midi_open_virtual", 2, nif_open_virtual, 0},
 };
+
+// ── mob_midi.h on iOS ─────────────────────────────────────────────────────
+// No native path yet (CoreMIDI read procs would feed the sink, MIDISend
+// with a packet timestamp would be mob_midi_send): the functions exist so
+// cross-platform native code links, and say so.
+#include "../../include/mob_midi.h"
+
+int mob_midi_abi_version(void) { return MOB_MIDI_ABI_VERSION; }
+
+int mob_midi_set_sink(mob_midi_sink_fn fn, void *ctx) {
+  (void)fn;
+  (void)ctx;
+  return MOB_MIDI_ERR_UNSUPPORTED;
+}
+
+int mob_midi_source_info(uint32_t source, uint32_t *generation,
+                         int32_t *device, int32_t *port) {
+  (void)source;
+  (void)generation;
+  (void)device;
+  (void)port;
+  return MOB_MIDI_ERR_UNSUPPORTED;
+}
+
+int mob_midi_send(mob_midi_port port, const uint8_t *bytes, size_t len,
+                  int64_t at_ns) {
+  (void)port;
+  (void)bytes;
+  (void)len;
+  (void)at_ns;
+  return MOB_MIDI_ERR_UNSUPPORTED;
+}
+
+int mob_midi_discard(mob_midi_port port) {
+  (void)port;
+  return MOB_MIDI_ERR_UNSUPPORTED;
+}
+
+int64_t mob_midi_now_ns(void) { return host_to_ns(mach_absolute_time()); }
 
 ERL_NIF_INIT(mob_midi_nif, nif_funcs, NULL, NULL, NULL, NULL)

@@ -14,12 +14,14 @@
 -module(mob_midi_nif).
 -export([
     midi_list_devices/0,
-    midi_open_input/2,
+    midi_open_input/3,
     midi_open_output/2,
     midi_close/1,
     midi_send/4,
     midi_now_ns/0,
-    midi_open_virtual/1,
+    midi_open_virtual/2,
+    midi_output_handle/2,
+    midi_discard/2,
     midi_scan_bluetooth/1,
     midi_stop_bluetooth_scan/0,
     midi_connect_bluetooth/1
@@ -35,7 +37,8 @@ init() ->
 midi_list_devices() ->
     erlang:nif_error(nif_not_loaded).
 
-midi_open_input(_DeviceId, _Port) ->
+%% Port -1 opens every port; Route: 1 BEAM, 2 native sink (mob_midi.h), 3 both.
+midi_open_input(_DeviceId, _Port, _Route) ->
     erlang:nif_error(nif_not_loaded).
 
 midi_open_output(_DeviceId, _Port) ->
@@ -50,7 +53,17 @@ midi_send(_DeviceId, _Port, _Bytes, _TimestampNs) ->
 midi_now_ns() ->
     erlang:nif_error(nif_not_loaded).
 
-midi_open_virtual(_Name) ->
+midi_open_virtual(_Name, _Route) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% {ok, Handle} for an open output (mob_midi.h mob_midi_port), or
+%% {error, not_open}.
+midi_output_handle(_DeviceId, _Port) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% {ok, Generation} after dropping an open output's queue (mob_midi_discard),
+%% or {error, not_open}. Android only; MobMidi gates it.
+midi_discard(_DeviceId, _Port) ->
     erlang:nif_error(nif_not_loaded).
 
 %% Android only (iOS pairs BLE-MIDI through its own UI); MobMidi gates it.

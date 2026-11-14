@@ -8,6 +8,181 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+Consolidation (stacked on the entries below, from #5): mob_midi becomes the one
+home for MIDI in Mob apps, so Humdinger's `humdinger_midi_port` and Magpie's
+`magpie_midi` plugins can be deleted. Design: `decisions/2026-11-13-consolidate-midi.md`.
+
+### Added
+- **Native C ABI** (`priv/include/mob_midi.h`, Android): another static NIF of
+  the app registers a sink with `mob_midi_set_sink/2` and gets `(source,
+  generation, bytes, len, timestamp_ns)` on the MIDI thread (no BEAM message,
+  no allocation), and sends with `mob_midi_send(handle, bytes, len, at_ns)`
+  from any thread. Implemented in `priv/native/android/mob_midi_core.c`
+  (`android.jni_source`). iOS links stubs that answer unsupported.
+- `open_input/3` takes `port: :all` (every port, each its own source) and
+  `deliver: :beam | :native | :both`; `open_virtual/3` takes `deliver:`.
+- `output_handle/2`; output `{:midi, :opened, ...}` carries `handle`, input
+  `:opened` carries `source`.
+- Sources and generations: bytes of a closed or reopened port are dropped once
+  `close/2` returns.
+- `MobMidi.Parser` (stream state across packets); `priv/include/mob_midi_parser.h`
+  (header-only C stream parser) with a host C test.
+- `mix mob_midi.gen.virtual_device`: writes the host's `MidiDeviceService`
+  declaration and `res/xml` from `--name/--inputs/--outputs` or
+  `config :mob_midi, :virtual_device` (`--check` for CI, `--remove`).
+- Device maps carry `address`; `{:midi, :bluetooth_device, ...}` carries `rssi`;
+  BLE errors `:bluetooth_off`, `:location_off`, `:bad_address`;
+  `connect_bluetooth/2` on a connected address answers `:connected` at once.
+- `tools/MidiProbe.java` + `tools/midi_probe.sh`: an external-process probe
+  for device checks (`"Name*"` matches a device by name prefix).
+- **`{:midi, :drained, %{device, port, handle, generation}}` and
+  `discard/2`** (Android): after a send answered `{:error, :queue_full}`, the
+  port refuses every send until its queue has drained (the dispatch thread is
+  back from the write it was stuck in, at most 128 chunks are left and the
+  largest message refused meanwhile fits); then
+  the port's opener gets `:drained`. `discard/2` (C: `mob_midi_discard`)
+  drops what is queued and starts a new queue generation, which `:drained`
+  carries (an own virtual output whose listeners all leave drops its queue,
+  bumps the generation and still reports `:drained` if it was refusing). The
+  queue logic lives in `priv/native/android/mob_midi_queue.h`, with a host C
+  test.
+
+### Changed
+- **Android sends go through a per-port queue** (256 chunks of 64 bytes,
+  ordered by `at:`) and a dispatch thread per open output. `send_raw/4`'s
+  `at:` is now held until that time (#5 stamped and wrote at once). A listener
+  that stops reading fills only its port's queue (`{:error, :queue_full}`);
+  the BEAM never blocks on it.
+- Port and device opens/closes run on a `mob_midi` worker thread, not the BEAM
+  scheduler or the UI thread. So do the `MidiManager` lookups behind
+  `list_devices`, `open_input`, `open_output`, `open_virtual`, and the
+  Bluetooth adapter checks of `scan_bluetooth` / `connect_bluetooth` (binder
+  calls): the NIFs only post the request, and the answers come from that
+  thread (a BLE scan itself still starts and stops on the main thread, where
+  Android delivers its results; `stop_bluetooth_scan` queues behind a pending
+  `scan_bluetooth`).
+- `close/2` racing an open still in flight: once `close/2` returns, no
+  `:opened` of an open asked for before it can arrive (it answers `{:midi,
+  :error, %{reason: :closed}}`); `:opened` is sent under the same lock
+  `close/2` takes.
+- Opens of one device share a single `MidiManager.openDevice` in flight
+  (Android). On Android ≤ 11 the system's `MidiService` walks a device's
+  connection list unlocked when its service connects, so a connection added
+  or removed meanwhile crashes `system_server` (the phone's system restarts).
+  Opening and closing a slow-starting device service in a loop, each open
+  adding a connection of its own, did that on an Android 10 phone. It also
+  ends the `:open_failed` a second open got while the first was in flight.
+- Text that carries names (the device list JSON, a virtual device's name, BLE
+  names and addresses) crosses JNI as UTF-8 byte arrays both ways, not
+  `GetStringUTFChars` / `NewStringUTF` (modified UTF-8 split characters
+  outside the BMP, such as an emoji in a device name, into invalid bytes, and
+  `NewStringUTF` rejects them).
+- `now_ns/0` reads `CLOCK_MONOTONIC` in C: mob's zig `nowNs` returned garbage
+  on 32-bit ARM (its `timespec` is two `i64`s).
+- `parse/1` follows running status and real-time interleave and decodes
+  aftertouch, SysEx and system messages (real-time bytes were `:raw`).
+- `open_output/3` on the app's own virtual device answers `{:midi, :error,
+  %{reason: :own_device}}` (send to it with `send_raw` after `open_virtual/3`).
+- Plugin manifest declares `BLUETOOTH`, `BLUETOOTH_ADMIN`,
+  `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, and `:midi_bluetooth`
+  requests location on Android 12+ too (fixes #5: on Android ≤ 11 it requested
+  an undeclared location permission, which Android denies).
+- NIF: `midi_open_input/3`, `midi_open_virtual/2`, new `midi_output_handle/2`,
+  new `midi_discard/2`.
+
+### Upgrading
+- `parse/1`: `0xF8`…`0xFF` now come back as `%{type: :clock | :start | ...}`
+  and running-status data as full events instead of `:raw` bytes; SysEx as one
+  `%{type: :sysex}`. Match on the new types.
+- `send_raw(..., at: t)` with `t` in the future now waits until `t` on Android.
+- `{:error, :queue_full}` is sticky on Android: the port refuses sends until
+  `{:midi, :drained, ...}` (C: `mob_midi_send` answers
+  `MOB_MIDI_ERR_QUEUE_FULL` until then).
+- Android: declare a virtual device with `mix mob_midi.gen.virtual_device`
+  (its resource is `@xml/mob_midi_device`).
+- A host C NIF includes `"../deps/mob_midi/priv/include/mob_midi.h"` (a path
+  dependency: include from that path).
+
+### Verified (this branch at 53bb2bf, moto e, Android 10, armeabi-v7a, throwaway mob.new 0.6.19 host)
+- `dumpsys midi`: hosted device `MobMidiProbe 🎹`, `mInputPortCount=1,
+  mOutputPortCount=2`, service `io.mob.midi.MobMidiDeviceService`; the app's
+  `primaryCpuAbi=armeabi-v7a`. The emoji name came back intact from
+  `list_devices`, from `open_virtual`'s `:opened`, and `open_virtual` found
+  the device by it; `connect_bluetooth("🎹:00:00")` answered `:bad_address`
+  and `open_virtual("Nope 🎸")` `:no_such_device`, app alive.
+- Probe → hosted input port (100 note pairs, 200 packets, running status +
+  `0xF8` inside messages): 200/200 to the BEAM, stamps identical to the
+  probe's `SENT` lines, 100 note-on / 100 note-off / 100 clock; sender →
+  bridge p50 1.24 ms, p95 1.60 ms; → BEAM process p50 1.93 ms, p95 2.85 ms.
+  The C sink (same receive path, run on the build before the last Kotlin
+  change): 200/200, stamps identical, the C parser 100 / 100 / 100,
+  `mob_midi_source_info` matched every call, → sink p50 1.12 ms, p95 1.38 ms.
+- Scheduled sends, ~400 ms ahead, 50 ms apart: 20 `send_raw at:` (port 0) and
+  20 `mob_midi_send` from a pthread (port 1): 40/40 at the probe stamped
+  exactly with the target, in order; arrival − target p50 2.18 / 2.01 ms,
+  p95 4.48 / 3.67 ms.
+- Message size: `mob_midi_send` of 16384 bytes into an empty queue accepted
+  and delivered whole (17 packets: 16 × 1015 + 144 bytes, all stamped with
+  the target; the last 120 ms after it); 16385 bytes → `MOB_MIDI_ERR_TOO_LARGE`
+  / `{:error, :too_large}`. An 8 KiB SysEx due at T and, while it was being
+  written, a 3-byte send stamped T − 10 ms: the SysEx arrived whole, the
+  note after it.
+- A 16 KiB send behind one note scheduled 300 ms ahead: `:queue_full`; a
+  small send still refused; no `:drained` within 100 ms; one `:drained`
+  3.9 ms after the note's target time; the 16 KiB resend accepted and
+  delivered whole. (Before this fix `:drained` came 0.5 ms after the
+  refusal, while the message still couldn't fit.)
+- `port: :all` on the app's own 2-port device (`deliver: :both`): two
+  sources, 10 messages per port to both the BEAM and the sink, by port.
+- Stalled listener (the probe blocks in its first `onSend`): 624 sends
+  accepted, then `:queue_full`; `mob_midi_send` from C then answered
+  `MOB_MIDI_ERR_QUEUE_FULL` too; `discard/2` → `{:ok, g}`, a send after it
+  still `:queue_full`; `:drained` 43.7 ms after the probe read again (50 ms
+  polling), 8.40 s after the refusal; the next send accepted. In 2 of 5 such
+  runs the dispatch thread came back from Android's write about 0.6 ms after
+  the refusal although the probe was still stalled (462 / 516 sends accepted
+  instead of 624), so `:drained` followed the discard at once; cause not
+  found.
+- A refusing own virtual output (256 notes scheduled 20 s ahead) whose only
+  listener left: `:drained` with a new generation within 1 ms, then
+  `:no_listener`. A listener killed while stalled: the queue is dropped but
+  no `:drained` (the dispatch thread's write stays blocked; see the known
+  limit on dead clients).
+- Open/close races, 120 rounds of `open_input(port: :all)` + `open_output` on
+  Magpie's device closed 0–300 ms later, twice (the second after `am
+  force-stop` of Magpie, so its service cold-started): 105 / 107 input and
+  102 / 104 output `:opened`, all before `close/2` returned; 33 + 29 opens
+  cancelled with `:closed`; no `:open_failed`; no `:opened` after a
+  `close/2`; `system_server` stayed up. Before the one-open-in-flight fix the
+  same loop crashed `system_server` once, 14 s after Magpie's service process
+  started (`ConcurrentModificationException` in
+  `MidiService$Device.setDeviceServer`), and an earlier run had 28
+  `:open_failed`.
+- Hot-plug: `pm disable-user` / `pm enable` of Magpie → `:device_removed` /
+  `:device_added` to the `list_devices` caller, re-list without / with it.
+
+### Verified (earlier on this branch, before `:drained`; MobDevFix_arm emulator, Android 15 arm64, throwaway mob.new 0.6.19 host)
+- `dumpsys midi`: hosted device `MobMidiProbe`, `mInputPortCount=1,
+  mOutputPortCount=2`, service `io.mob.midi.MobMidiDeviceService`.
+- Probe → hosted input port (100 packets, running status + `0xF8` inside
+  messages): 100/100 to the BEAM and 100/100 to a static C NIF's sink, stamps
+  equal to the probe's; Elixir and C parsers each 50 note-on, 50 note-off, 50
+  clock. Sender → bridge p50 0.19–0.23 ms, p95 0.36 ms; → BEAM process p50
+  0.34–0.39 ms; → sink p50 0.19–0.23 ms.
+- Scheduled sends (20 from `send_raw at:`, 20 from `mob_midi_send` on a
+  pthread, issued ~300 ms ahead): 40/40 at the probe stamped exactly with the
+  target; arrival − target p50 0.65–2.9 ms, p95 2.3–10 ms (host load average
+  ~900 during the runs; Magpie measured p50 0.7–1.1 ms on the same emulator).
+- `port: :all` on a 2-port device: two sources; `deliver: :native` reached only
+  the sink, reopening with `:beam` only the BEAM, old sources then invalid.
+- Stalled listener: 3000 sends to its port → 557 queued, 2443 `:queue_full`,
+  slowest `send_raw` 0.34 ms; the other port 50/50; the probe got all 557 once
+  it read again.
+- Hot-plug: `:device_removed` / `:device_added` when another app's MIDI
+  service was disabled / enabled; `:virtual_status` sender/listener counts.
+- Not verified: USB and BLE-MIDI hardware, `connect_bluetooth/2` against a
+  device, iOS (compile-checked against the iOS SDK only).
+
 ### Added
 - **Ports.** `open_input/3`, `open_output/3` and `send_raw/4` take `port:`
   (default 0); `list_devices/1` reports `input_ports` / `output_ports`. Android

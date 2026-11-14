@@ -28,13 +28,26 @@ end
 ```
 
 Waiting for `:opened` is optional: Android opens the port asynchronously and
-queues sends made before it opens (up to 256 per device), writing them in order
+queues sends made before it opens (up to 256 64-byte chunks per port), writing them in order
 the moment it does. If the open fails, the queue is discarded and the error's
 `dropped` counts the lost messages (`close/2` during the open reports `reason:
 :closed` the same way). `send_*` return `socket` when the message was written or
 queued and `{:error, reason}` when it wasn't (`:not_open`, `:queue_full`,
-`:no_such_device`, `:too_large` for iOS sends over 256 bytes, `:send_failed`), so
+`:no_such_device`, `:too_large` for one send over 256 bytes on iOS or 16 KiB on Android, `:send_failed`), so
 bind the result instead of piping it on as the socket.
+
+**Back-pressure (Android).** Sends join the port's queue and a thread of the
+port's own writes them, so a listener that stops reading never blocks the
+caller. When its queue is full, the send answers `{:error, :queue_full}` and
+the port refuses every send until it has drained (the stuck write returned,
+at most half the queue is left and the largest refused message fits). The
+process that opened the port then gets
+`{:midi, :drained, %{device: id, port: n, handle: h, generation: g}}`.
+`MobMidi.discard(id, port: n)` drops what is still queued (stale notes the
+listener would otherwise play late) and returns `{:ok, generation}`; the next
+`:drained` carries it, or a later one (an own virtual output whose listeners
+all leave drops its queue too). The usual reaction to `:queue_full`: discard,
+wait for `:drained`, send note-offs or all-notes-off, then carry on.
 
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.
@@ -64,48 +77,51 @@ devices: other apps on the phone see it, play into it (arriving as `{:midi,
 
 On iOS it creates a CoreMIDI source + destination of that name. On Android a
 virtual device is declared in the app's manifest (Android reads its name and
-ports from there, so the plugin can't contribute it), using the plugin's
+ports from the app's own `res/xml`, so a plugin can't contribute a per-app
+one). Generate the declaration, which uses the plugin's
 `io.mob.midi.MobMidiDeviceService`:
 
-```xml
-<!-- android/app/src/main/AndroidManifest.xml, inside <application> -->
-<service android:name="io.mob.midi.MobMidiDeviceService"
-    android:exported="true"
-    android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
-    <intent-filter>
-        <action android:name="android.media.midi.MidiDeviceService" />
-    </intent-filter>
-    <meta-data android:name="android.media.midi.MidiDeviceService"
-        android:resource="@xml/my_synth_midi" />
-</service>
+```sh
+mix mob_midi.gen.virtual_device --name "My Synth" --inputs 1 --outputs 1
+# writes android/app/src/main/res/xml/mob_midi_device.xml and a fenced
+# <service> block in android/app/src/main/AndroidManifest.xml;
+# --check in CI, --remove to take it out; or config :mob_midi, :virtual_device
 ```
 
-```xml
-<!-- android/app/src/main/res/xml/my_synth_midi.xml -->
-<devices>
-    <device name="My Synth" manufacturer="Me" product="My Synth">
-        <input-port name="in" />
-        <output-port name="out" />
-    </device>
-</devices>
-```
-
+`--inputs` are ports other apps send into the app, `--outputs` ports it sends
+out of (Humdinger: `--inputs 0 --outputs 1`; Magpie: `--inputs 1 --outputs 1`).
 Then `MobMidi.open_virtual(socket, "My Synth")`. Android also reports who has
 it open: `{:midi, :virtual_status, %{device: id, senders: n, listeners: n}}`.
 A second device needs its own `<service>`: declare an empty subclass of
 `io.mob.midi.MobMidiDeviceService` in the app. Android starts the service when
 another app opens the device, possibly before the BEAM is up; bytes sent before
-`open_virtual/2` are dropped.
+`open_virtual/3` are dropped.
+
+## Native code (Android): `priv/include/mob_midi.h`
+
+An audio engine in another static NIF of the app can take MIDI without the
+BEAM: open inputs with `deliver: :native` (or `:both`, per port), register a
+sink with `mob_midi_set_sink(fn, ctx)` and get `(source, generation, bytes,
+len, timestamp_ns)` on the MIDI thread; pass an output's `handle` (from
+`:opened` or `MobMidi.output_handle/2`) to it and call `mob_midi_send(handle,
+bytes, len, at_ns)` from its own thread. Sends wait in the port's queue until
+`at_ns` (the BEAM's `send_raw(..., at:)` shares that queue);
+`mob_midi_discard(handle)` drops what is queued. Include it relative to your
+source: `#include "../deps/mob_midi/priv/include/mob_midi.h"` (a path
+dependency: the dependency's own path).
+The header documents thread and lifetime rules;
+`priv/include/mob_midi_parser.h` is a matching header-only stream parser.
 
 ## Bluetooth MIDI devices (Android)
 
 `MobMidi.scan_bluetooth(socket)` finds BLE-MIDI devices (`{:midi,
-:bluetooth_device, %{address: a, name: n}}`), `MobMidi.connect_bluetooth(socket,
+:bluetooth_device, %{address: a, name: n, rssi: dbm}}`), `MobMidi.connect_bluetooth(socket,
 address)` connects one, which then lists and opens like a USB device; `close/2`
 disconnects it. Ask for the `:midi_bluetooth` permission first
-(`Mob.Permissions.request(socket, :midi_bluetooth)`). On Android 11 and older,
-scanning needs `ACCESS_FINE_LOCATION`, which the host declares (with
-`android:maxSdkVersion="30"`). iOS pairs BLE-MIDI devices in the system UI
+(`Mob.Permissions.request(socket, :midi_bluetooth)`). The plugin declares the Bluetooth
+and location permissions scanning needs; the request includes location on every
+version (Android 12+ too, as mob_dev can't mark `BLUETOOTH_SCAN`
+`neverForLocation`), and scans need location switched on (`:location_off`). iOS pairs BLE-MIDI devices in the system UI
 (`CABTMIDICentralViewController`); they are then ordinary CoreMIDI devices.
 
 ## Demo screens (tier 3)
@@ -141,8 +157,16 @@ Ports, timestamps, hot-plug and virtual devices were then checked on an Android
 emulator by a host app (FMutate) with a `MobMidiDeviceService` device played by,
 and listening to, a second app; the iOS side of them is compile-checked only.
 
+0.3 was checked on a moto e (Android 10, 32-bit armeabi-v7a)
+and an Android 15 arm64 emulator with a throwaway host app, a static C NIF
+and `tools/MidiProbe.java` as another process: delivery to the BEAM and the C
+sink with the sender's stamps, scheduled sends, `port: :all`, a stalled
+listener through `:queue_full`, `discard/2` and `:drained`, open/close races,
+hot-plug and an emoji device name; numbers in the CHANGELOG.
+
 Not verified: USB-MIDI and BLE-MIDI hardware on either platform (including the
-`MobMidi.Ble` peripheral and `connect_bluetooth/2`).
+`MobMidi.Ble` peripheral and `connect_bluetooth/2`), and the native C path on
+iOS (it has none yet: the `mob_midi.h` functions answer unsupported there).
 
 Activating both mob_midi and mob_bluetooth: both declare
 `NSBluetoothAlwaysUsageDescription`, and mob_dev (0.7.14) refuses the native
