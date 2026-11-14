@@ -60,19 +60,67 @@ defmodule MobMidiTest do
   end
 
   describe "parse_devices/1" do
-    test "passes a list of device maps through, normalising direction" do
-      ios = [%{id: 7, name: "Oxygen 49", direction: :input}]
-      assert MobMidi.parse_devices(ios) == [%{id: 7, name: "Oxygen 49", direction: :input}]
+    test "fills the fields an iOS endpoint list leaves out from its direction" do
+      ios = [
+        %{id: 7, name: "Oxygen 49", direction: :input},
+        %{id: 8, name: "My Synth", direction: :output, type: :virtual, own: true}
+      ]
+
+      assert MobMidi.parse_devices(ios) == [
+               %{
+                 id: 7,
+                 name: "Oxygen 49",
+                 direction: :input,
+                 manufacturer: "",
+                 type: :other,
+                 input_ports: 1,
+                 output_ports: 0,
+                 own: false
+               },
+               %{
+                 id: 8,
+                 name: "My Synth",
+                 direction: :output,
+                 manufacturer: "",
+                 type: :virtual,
+                 input_ports: 0,
+                 output_ports: 1,
+                 own: true
+               }
+             ]
     end
 
-    test "decodes the Android JSON payload (string keys + string direction)" do
+    test "decodes the Android JSON payload: string keys, ports, type, own" do
       json =
-        ~s([{"id":7,"name":"Oxygen 49","direction":"input"},{"id":9,"name":"Synth","direction":"output"}])
+        ~s([{"id":7,"name":"Oxygen 49","direction":"input","manufacturer":"M-Audio","type":"usb",) <>
+          ~s("input_ports":2,"output_ports":0,"own":false},) <>
+          ~s({"id":9,"name":"FMutate A","direction":"both","manufacturer":"FMutate","type":"virtual",) <>
+          ~s("input_ports":1,"output_ports":1,"own":true}])
 
-      assert MobMidi.parse_devices(json) == [
-               %{id: 7, name: "Oxygen 49", direction: :input},
-               %{id: 9, name: "Synth", direction: :output}
-             ]
+      assert [usb, own] = MobMidi.parse_devices(json)
+
+      assert usb == %{
+               id: 7,
+               name: "Oxygen 49",
+               direction: :input,
+               manufacturer: "M-Audio",
+               type: :usb,
+               input_ports: 2,
+               output_ports: 0,
+               own: false
+             }
+
+      assert %{direction: :both, type: :virtual, own: true, input_ports: 1, output_ports: 1} = own
+    end
+
+    test "an own: false atom key isn't overwritten by a missing string twin" do
+      assert [%{own: false}] =
+               MobMidi.parse_devices([%{id: 1, name: "x", direction: :input, own: false}])
+    end
+
+    test "an unknown type is :other rather than a new atom" do
+      json = ~s([{"id":1,"name":"x","direction":"input","type":"network"}])
+      assert [%{type: :other}] = MobMidi.parse_devices(json)
     end
 
     test "tolerates garbage" do
@@ -95,6 +143,23 @@ defmodule MobMidiTest do
       assert MobMidi.send_result(socket, {:error, :not_open}) == {:error, :not_open}
       assert MobMidi.send_result(socket, {:error, :queue_full}) == {:error, :queue_full}
       assert MobMidi.send_result(socket, :error) == {:error, :send_failed}
+      assert MobMidi.send_result(socket, {:error, :no_listener}) == {:error, :no_listener}
+    end
+  end
+
+  describe "send options" do
+    test "port and at default to port 0, now (0)" do
+      assert MobMidi.port([]) == 0
+      assert MobMidi.timestamp([]) == 0
+      assert MobMidi.port(port: 3) == 3
+      assert MobMidi.timestamp(at: 123_456_789) == 123_456_789
+    end
+
+    test "a negative or non-integer port / timestamp raises before reaching the NIF" do
+      assert_raise ArgumentError, ~r/port/, fn -> MobMidi.port(port: -1) end
+      assert_raise ArgumentError, ~r/port/, fn -> MobMidi.port(port: "1") end
+      assert_raise ArgumentError, ~r/at/, fn -> MobMidi.timestamp(at: -5) end
+      assert_raise ArgumentError, ~r/at/, fn -> MobMidi.timestamp(at: 1.5) end
     end
   end
 
@@ -142,11 +207,39 @@ defmodule MobMidiTest do
       assert MobMidi.Platform.unsupported?(:host)
     end
 
+    test "connecting Bluetooth devices from code is Android-only" do
+      assert MobMidi.Platform.bluetooth_central?(:android)
+      refute MobMidi.Platform.bluetooth_central?(:ios)
+      refute MobMidi.Platform.bluetooth_central?(:host)
+    end
+
+    test "on a host (mob's NIF not loaded) the API says unsupported instead of raising" do
+      assert MobMidi.Platform.current() == :host
+      assert MobMidi.list_devices(:socket) == {:error, :unsupported}
+      assert MobMidi.open_input(:socket, 1, port: 1) == {:error, :unsupported}
+      assert MobMidi.open_virtual(:socket, "Synth") == {:error, :unsupported}
+      assert MobMidi.send_raw(:socket, 1, <<0xF8>>, at: 1) == {:error, :unsupported}
+      assert MobMidi.scan_bluetooth(:socket) == {:error, :unsupported}
+      assert MobMidi.connect_bluetooth(:socket, "AA:BB") == {:error, :unsupported}
+    end
+
+    test "now_ns falls back to the BEAM's monotonic clock on a host" do
+      a = MobMidi.now_ns()
+      b = System.monotonic_time(:nanosecond)
+      assert is_integer(a) and a <= b
+    end
+
     # credo:disable-for-next-line Jump.CredoChecks.VacuousTest
     test "the NIF stub exports the midi_* surface + is nif_not_loaded on host" do
       exports = :mob_midi_nif.module_info(:exports)
       assert {:midi_list_devices, 0} in exports
-      assert {:midi_send, 2} in exports
+      assert {:midi_open_input, 2} in exports
+      assert {:midi_open_output, 2} in exports
+      assert {:midi_send, 4} in exports
+      assert {:midi_now_ns, 0} in exports
+      assert {:midi_open_virtual, 1} in exports
+      assert {:midi_scan_bluetooth, 1} in exports
+      assert {:midi_connect_bluetooth, 1} in exports
       assert_raise ErlangError, ~r/nif_not_loaded/, fn -> :mob_midi_nif.midi_list_devices() end
     end
   end
@@ -175,6 +268,7 @@ defmodule MobMidiTest do
       langs = Enum.map(m.nifs, & &1.lang) |> Enum.sort()
       assert langs == [:objc, :zig]
       assert "CoreMIDI" in m.ios.frameworks
+      assert %{capability: :midi_bluetooth} in m.permissions
     end
 
     # credo:disable-for-next-line Jump.CredoChecks.VacuousTest

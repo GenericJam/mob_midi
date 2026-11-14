@@ -44,6 +44,70 @@ manifest) lists MIDI devices through the NIF; run it from a host app with
 `mix mob.selftest` (mob_dev 0.7.17+). No attached MIDI device is a
 `:needs_hardware` skip.
 
+## Ports, timestamps, hot-plug
+
+- **Ports**: `list_devices/1` reports each device's `input_ports` /
+  `output_ports`; `open_input/3`, `open_output/3` and `send_raw/4` take
+  `port:` (default 0). CoreMIDI endpoints are single ports.
+- **Timestamps**: incoming `{:midi, :raw, ...}` carries the sender's
+  `timestamp` and when the bridge `received` it (ns on the `MobMidi.now_ns/0`
+  clock). `send_raw(socket, id, bytes, at: ns)` stamps outgoing bytes for when
+  the receiver should act on them: MIDI clock without the BEAM's timer jitter.
+- **Hot-plug**: the last `list_devices/1` caller gets `{:midi, :device_added |
+  :device_removed, nil}` on both platforms.
+
+## Virtual devices (the app as a MIDI device)
+
+`MobMidi.open_virtual(socket, name)` subscribes to one of the app's own MIDI
+devices: other apps on the phone see it, play into it (arriving as `{:midi,
+:raw, ...}`) and listen to what `send_raw/4` sends to its id.
+
+On iOS it creates a CoreMIDI source + destination of that name. On Android a
+virtual device is declared in the app's manifest (Android reads its name and
+ports from there, so the plugin can't contribute it), using the plugin's
+`io.mob.midi.MobMidiDeviceService`:
+
+```xml
+<!-- android/app/src/main/AndroidManifest.xml, inside <application> -->
+<service android:name="io.mob.midi.MobMidiDeviceService"
+    android:exported="true"
+    android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
+    <intent-filter>
+        <action android:name="android.media.midi.MidiDeviceService" />
+    </intent-filter>
+    <meta-data android:name="android.media.midi.MidiDeviceService"
+        android:resource="@xml/my_synth_midi" />
+</service>
+```
+
+```xml
+<!-- android/app/src/main/res/xml/my_synth_midi.xml -->
+<devices>
+    <device name="My Synth" manufacturer="Me" product="My Synth">
+        <input-port name="in" />
+        <output-port name="out" />
+    </device>
+</devices>
+```
+
+Then `MobMidi.open_virtual(socket, "My Synth")`. Android also reports who has
+it open: `{:midi, :virtual_status, %{device: id, senders: n, listeners: n}}`.
+A second device needs its own `<service>`: declare an empty subclass of
+`io.mob.midi.MobMidiDeviceService` in the app. Android starts the service when
+another app opens the device, possibly before the BEAM is up; bytes sent before
+`open_virtual/2` are dropped.
+
+## Bluetooth MIDI devices (Android)
+
+`MobMidi.scan_bluetooth(socket)` finds BLE-MIDI devices (`{:midi,
+:bluetooth_device, %{address: a, name: n}}`), `MobMidi.connect_bluetooth(socket,
+address)` connects one, which then lists and opens like a USB device; `close/2`
+disconnects it. Ask for the `:midi_bluetooth` permission first
+(`Mob.Permissions.request(socket, :midi_bluetooth)`). On Android 11 and older,
+scanning needs `ACCESS_FINE_LOCATION`, which the host declares (with
+`android:maxSdkVersion="30"`). iOS pairs BLE-MIDI devices in the system UI
+(`CABTMIDICentralViewController`); they are then ordinary CoreMIDI devices.
+
 ## Demo screens (tier 3)
 
 Two screens the host auto-lists via `Mob.Plugins.screens()`:
@@ -73,8 +137,12 @@ virtual endpoints (a `MIDIDestinationCreate` synth echoing to a
 `MIDISourceCreate` source): `list_devices/1`, `open_output/2` events, `send_*`
 (including the `:not_open` error) and `open_input/2` receive.
 
+Ports, timestamps, hot-plug and virtual devices were then checked on an Android
+emulator by a host app (FMutate) with a `MobMidiDeviceService` device played by,
+and listening to, a second app; the iOS side of them is compile-checked only.
+
 Not verified: USB-MIDI and BLE-MIDI hardware on either platform (including the
-`MobMidi.Ble` peripheral). Android assumes a single port per device (port 0).
+`MobMidi.Ble` peripheral and `connect_bluetooth/2`).
 
 Activating both mob_midi and mob_bluetooth: both declare
 `NSBluetoothAlwaysUsageDescription`, and mob_dev (0.7.14) refuses the native

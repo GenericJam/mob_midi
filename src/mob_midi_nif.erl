@@ -14,10 +14,15 @@
 -module(mob_midi_nif).
 -export([
     midi_list_devices/0,
-    midi_open_input/1,
-    midi_open_output/1,
+    midi_open_input/2,
+    midi_open_output/2,
     midi_close/1,
-    midi_send/2
+    midi_send/4,
+    midi_now_ns/0,
+    midi_open_virtual/1,
+    midi_scan_bluetooth/1,
+    midi_stop_bluetooth_scan/0,
+    midi_connect_bluetooth/1
 ]).
 -on_load(init/0).
 
@@ -30,14 +35,30 @@ init() ->
 midi_list_devices() ->
     erlang:nif_error(nif_not_loaded).
 
-midi_open_input(_DeviceId) ->
+midi_open_input(_DeviceId, _Port) ->
     erlang:nif_error(nif_not_loaded).
 
-midi_open_output(_DeviceId) ->
+midi_open_output(_DeviceId, _Port) ->
     erlang:nif_error(nif_not_loaded).
 
 midi_close(_DeviceId) ->
     erlang:nif_error(nif_not_loaded).
 
-midi_send(_DeviceId, _Bytes) ->
+midi_send(_DeviceId, _Port, _Bytes, _TimestampNs) ->
+    erlang:nif_error(nif_not_loaded).
+
+midi_now_ns() ->
+    erlang:nif_error(nif_not_loaded).
+
+midi_open_virtual(_Name) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% Android only (iOS pairs BLE-MIDI through its own UI); MobMidi gates it.
+midi_scan_bluetooth(_DurationMs) ->
+    erlang:nif_error(nif_not_loaded).
+
+midi_stop_bluetooth_scan() ->
+    erlang:nif_error(nif_not_loaded).
+
+midi_connect_bluetooth(_Address) ->
     erlang:nif_error(nif_not_loaded).

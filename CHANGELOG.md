@@ -6,6 +6,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Ports.** `open_input/3`, `open_output/3` and `send_raw/4` take `port:`
+  (default 0); `list_devices/1` reports `input_ports` / `output_ports`. Android
+  opened port 0 only.
+- **Timestamps.** `{:midi, :raw, ...}` carries `port`, `timestamp` (the
+  sender's) and `received` (when the bridge got it), in ns on the clock of the
+  new `MobMidi.now_ns/0`. `send_raw/4` takes `at:` to stamp outgoing bytes.
+- **Android hot-plug**: `{:midi, :device_added | :device_removed, nil}` to the
+  last `list_devices/1` caller, as iOS already did; a removed device's ports
+  are closed.
+- **Virtual devices**: `open_virtual/2` subscribes to one of the app's own MIDI
+  devices that other apps play into and listen to (`{:midi, :raw, ...}` in,
+  `send_raw/4` out). Android: the host declares
+  `io.mob.midi.MobMidiDeviceService` in its manifest (README) and gets
+  `{:midi, :virtual_status, %{device, senders, listeners}}`; iOS: a CoreMIDI
+  source + destination created by the call.
+- **BLE-MIDI central (Android)**: `scan_bluetooth/2`, `stop_bluetooth_scan/1`,
+  `connect_bluetooth/2` (`MidiManager.openBluetoothDevice`), and the
+  `:midi_bluetooth` permission capability for `Mob.Permissions.request/2`.
+- `list_devices/1` entries carry `manufacturer`, `type` (`:usb | :bluetooth |
+  :virtual | :other`) and `own` (the app's own virtual devices);
+  `parse_devices/1` normalises them.
+- `open_input/3` answers `{:midi, :opened, %{device, port, direction: :input}}`
+  or an `op: :open_input` error (`:no_such_device`, `:no_such_port`,
+  `:open_failed`, `:no_output_port`) on both platforms; Android was silent.
+
+### Changed
+- **Breaking (NIF):** `midi_open_input/2`, `midi_open_output/2`,
+  `midi_send/4` take the port (and the send timestamp); the `MobMidi`
+  functions keep their old arities through default options.
+- `{:midi, :opened, ...}` for outputs carries `port`.
+- `send_*` can return `{:error, :no_listener}` (a virtual device nobody
+  listens to).
+- `MobMidi.Platform.current/0` is `:host` when mob's NIF isn't loaded, so the
+  API returns `{:error, :unsupported}` on a host instead of raising.
+
+### Verified
+- Android emulator (API 37, x86_64), with FMutate as the host app and a
+  second app on the same key: FMutate's declared `MobMidiDeviceService`
+  device listed by `dumpsys midi`, played into by the second app (notes
+  heard, `timestamp` / `received` on every packet, the sender → BEAM trip
+  unchanged from FMutate's previous in-app bridge, median ~0.1 ms) and
+  listened to (MIDI clock with `at:` stamps arriving exactly 20.833 ms apart
+  at 120 BPM; `:virtual_status` listener counts); the second app's own
+  virtual device opened as an input and played; hot-plug (reinstalling the
+  second app removed and re-added its device; re-listed and reopened under its
+  new id); the `:midi_bluetooth` permission dialog through
+  `Mob.Permissions.request/2` and a 10 s `scan_bluetooth/2` started and
+  stopped (no BLE-MIDI device in range).
+- iOS: `mob_midi_nif.m` syntax-checked with clang against stub CoreMIDI /
+  Foundation headers only; not built for or run on iOS.
+- Not verified: USB / BLE-MIDI hardware, `connect_bluetooth/2` against a
+  real device, multi-port hardware.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added

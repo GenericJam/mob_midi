@@ -15,14 +15,26 @@
     # module src/mob_midi_nif.erl and implement the same midi_* functions.
     %{module: :mob_midi_nif, native_dir: "priv/native/ios", lang: :objc, platform: :ios}
   ],
+  # Runtime permission capability (Android): MobMidiBridge, a
+  # MobPermissionProvider, maps :midi_bluetooth to what MobMidi.scan_bluetooth/2
+  # and connect_bluetooth/2 need (BLUETOOTH_SCAN + BLUETOOTH_CONNECT on 12+,
+  # ACCESS_FINE_LOCATION before), so Mob.Permissions.request(socket,
+  # :midi_bluetooth) shows the dialog.
+  permissions: [
+    %{capability: :midi_bluetooth}
+  ],
   android: %{
     # USB-MIDI needs no permission. BLE-MIDI scanning gates on the Android 12+
-    # Nearby-devices group (request :bluetooth_connect before scanning for
+    # Nearby-devices group (request :midi_bluetooth before scanning for
     # wireless controllers).
     permissions: [
       "android.permission.BLUETOOTH_CONNECT",
       "android.permission.BLUETOOTH_SCAN"
     ],
+    # Also holds MobMidiDeviceService, the class a host's manifest names for
+    # its own virtual MIDI devices (MobMidi.open_virtual/2; README "Virtual
+    # devices"): the device's name is the host's, so the <service> and its
+    # res/xml device info are the host's to declare.
     bridge_kt: "priv/native/android/MobMidiBridge.kt",
     bridge_class: "io.mob.midi.MobMidiBridge"
   },

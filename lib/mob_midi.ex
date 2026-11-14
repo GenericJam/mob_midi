@@ -24,18 +24,20 @@ defmodule MobMidi do
   the device has no MIDI support) or `:no_client` (iOS: `MIDIClientCreate`
   failed). An empty list means the platform answered and found no devices.
 
-  Hot-plug: on iOS a device appearing / disappearing sends
-  `{:midi, :device_added, nil}` / `{:midi, :device_removed, nil}` to the last
-  `list_devices/1` caller; re-list on either. Android doesn't deliver hot-plug
-  events yet, so re-run `list_devices/1` there.
+  Hot-plug: a device appearing / disappearing sends `{:midi, :device_added,
+  nil}` / `{:midi, :device_removed, nil}` to the last `list_devices/1` caller,
+  on both platforms; re-list on either. On Android a removed device's open
+  ports are closed.
 
   ## Receiving
 
-      MobMidi.open_input(socket, device_id)   # subscribe to that source
+      MobMidi.open_input(socket, device_id)            # port 0
+      MobMidi.open_input(socket, device_id, port: 1)   # a multi-port device
 
   Incoming MIDI is delivered to the calling process as raw packets:
 
-      {:midi, :raw, %{device: id, bytes: <<0x90, 60, 100>>}}
+      {:midi, :raw, %{device: id, port: 0, bytes: <<0x90, 60, 100>>,
+                      timestamp: sent_ns, received: received_ns}}
 
   Parse it with `parse/1` (pure, so it's unit-testable and you decide how much
   to decode):
@@ -71,7 +73,7 @@ defmodule MobMidi do
         do: {:noreply, Mob.Socket.assign(socket, :midi_error, reason)}
 
   You don't have to wait for `:opened`: Android opens the port asynchronously,
-  and sends made before it opens are queued (up to 256 messages per device)
+  and sends made before it opens are queued (up to 256 messages per port)
   and written in order the moment it does. If the open fails, the queue is
   discarded and the error event's `dropped` says how many messages were lost.
   iOS opens synchronously, so the event arrives before `open_output/2` returns.
@@ -80,22 +82,41 @@ defmodule MobMidi do
   `{:error, reason}` when it wasn't: `:not_open` (no `open_output/2` for that
   device, or it was closed or failed to open), `:queue_full`, `:no_such_device`
   (iOS: the destination disappeared), `:too_large` (iOS: over 256 bytes in one
-  send) or `:send_failed`; `{:error, :unsupported}` on the host and
-  `{:error, :nif_not_loaded}` if the native bridge isn't registered. So bind the
-  result rather than piping it on as the socket.
+  send), `:no_listener` (a virtual device nobody listens to) or `:send_failed`;
+  `{:error, :unsupported}` on the host and `{:error, :nif_not_loaded}` if the
+  native bridge isn't registered. So bind the result rather than piping it on
+  as the socket.
 
   Channels are `0..15` on the wire (shown as 1..16 in most UIs). Notes /
   velocities / values are `0..127`.
 
+  ## Timing
+
+  `now_ns/0` is the clock of MIDI timestamps. Incoming packets carry the
+  sender's `timestamp` and when the bridge `received` them, so an app can see
+  what delivery costs; `send_raw/4` with `at:` stamps outgoing bytes for when
+  the receiver should act on them (MIDI clock without the BEAM's jitter).
+
+  ## Virtual devices
+
+  `open_virtual/2` makes the app itself a MIDI device other apps can play
+  into and listen to (a software synth's input, say). See its doc and the
+  README for the Android declaration.
+
+  ## Bluetooth
+
+  On Android, `scan_bluetooth/2` finds BLE-MIDI devices and
+  `connect_bluetooth/2` connects one, after which it is an ordinary device.
+  iOS pairs BLE-MIDI devices through the system UI.
+
   ## Status: experimental
 
-  The native MIDI paths are experimental. Verified for 0.1.2 against virtual
-  MIDI devices: on an Android emulator (`android.media.midi.MidiDeviceService`
-  loopbacks in a test host app) and on the iOS simulator (CoreMIDI virtual
-  endpoints), covering `list_devices/1`, `open_output/2` and its events, sends
-  queued before the port opened (Android), `send_*` errors, `open_input/2`
-  receive and `close/2`. Not verified: USB-MIDI and BLE-MIDI hardware on either
-  platform, including `MobMidi.Ble`. Android uses port 0 of each device.
+  The native MIDI paths are experimental. Verified against virtual MIDI
+  devices on an Android emulator (`android.media.midi.MidiDeviceService`
+  loopbacks in a test host app) and, for 0.1.2, on the iOS simulator (CoreMIDI
+  virtual endpoints). Not verified: USB-MIDI and BLE-MIDI hardware on either
+  platform, including `MobMidi.Ble` and `connect_bluetooth/2`. See the
+  CHANGELOG for what each release checked.
   """
 
   import Bitwise
@@ -118,30 +139,41 @@ defmodule MobMidi do
   end
 
   @doc """
-  Subscribe to a device's MIDI input. Incoming packets arrive as
-  `{:midi, :raw, %{device: id, bytes: binary}}` to the calling process.
+  Subscribe to a device's MIDI input. Options: `port:` (default 0), one of the
+  device's `input_ports`. The calling process receives `{:midi, :opened,
+  %{device: id, port: port, direction: :input}}`, then each incoming packet as
+  `{:midi, :raw, %{device: id, port: port, bytes: binary, timestamp: ns,
+  received: ns}}` (`timestamp`: the sender's stamp; `received`: when the
+  bridge got it; both on the `now_ns/0` clock). Errors: `{:midi, :error,
+  %{op: :open_input, reason: :no_such_device | :no_such_port | :open_failed |
+  ...}}`.
   """
-  @spec open_input(term(), device_id()) :: term()
-  def open_input(socket, device_id) when is_integer(device_id) do
-    guarded(socket, fn -> :mob_midi_nif.midi_open_input(device_id) end)
+  @spec open_input(term(), device_id(), keyword()) :: term()
+  def open_input(socket, device_id, opts \\ []) when is_integer(device_id) do
+    port = port(opts)
+    guarded(socket, fn -> :mob_midi_nif.midi_open_input(device_id, port) end)
   end
 
   @doc """
-  Open a device's MIDI output so `send_*` can write to it.
+  Open a device's MIDI output so `send_*` can write to it. Options: `port:`
+  (default 0), one of the device's `output_ports`; `send_raw/4` takes the
+  same `port:`.
 
-  The calling process receives `{:midi, :opened, %{device: id, direction:
-  :output}}` when the port is ready, or `{:midi, :error, %{device: id, op:
-  :open_output, reason: reason, dropped: n}}` when it can't be opened (reasons
-  include `:no_such_device`, `:open_failed`, `:no_input_port`, and `:closed`
-  when `close/2` cancels an open still in flight). Sends made before `:opened`
-  are queued and flushed in order; see "Sending" above.
+  The calling process receives `{:midi, :opened, %{device: id, port: port,
+  direction: :output}}` when the port is ready, or `{:midi, :error, %{device:
+  id, op: :open_output, reason: reason, dropped: n}}` when it can't be opened
+  (reasons include `:no_such_device`, `:no_such_port`, `:open_failed`,
+  `:no_input_port`, and `:closed` when `close/2` cancels an open still in
+  flight). Sends made before `:opened` are queued and flushed in order; see
+  "Sending" above.
   """
-  @spec open_output(term(), device_id()) :: term()
-  def open_output(socket, device_id) when is_integer(device_id) do
-    guarded(socket, fn -> :mob_midi_nif.midi_open_output(device_id) end)
+  @spec open_output(term(), device_id(), keyword()) :: term()
+  def open_output(socket, device_id, opts \\ []) when is_integer(device_id) do
+    port = port(opts)
+    guarded(socket, fn -> :mob_midi_nif.midi_open_output(device_id, port) end)
   end
 
-  @doc "Close any open input/output for `device_id`."
+  @doc "Close every open input/output port of `device_id` (disconnects a Bluetooth device)."
   @spec close(term(), device_id()) :: term()
   def close(socket, device_id) when is_integer(device_id) do
     guarded(socket, fn -> :mob_midi_nif.midi_close(device_id) end)
@@ -174,17 +206,95 @@ defmodule MobMidi do
   @doc """
   Send raw MIDI bytes (SysEx, or anything `send_*` doesn't cover).
 
+  Options: `port:` (default 0, see `open_output/3`) and `at:`, a `now_ns/0`
+  timestamp telling the receiver when to act on the bytes (default: now).
+  Stamping ahead of time takes the BEAM's scheduling jitter out of timing that
+  matters, such as MIDI clock, for receivers that honour timestamps (Android
+  passes the stamp to the receiving app; iOS schedules the packet).
+
   Returns `socket` when the bytes were written, or queued while the output is
   still opening; `{:error, reason}` when they weren't (see "Sending" above).
   """
-  @spec send_raw(term(), device_id(), binary()) :: term()
-  def send_raw(socket, device_id, bytes) when is_integer(device_id) and is_binary(bytes) do
+  @spec send_raw(term(), device_id(), binary(), keyword()) :: term()
+  def send_raw(socket, device_id, bytes, opts \\ [])
+      when is_integer(device_id) and is_binary(bytes) do
     if MobMidi.Platform.unsupported?(MobMidi.Platform.current()) do
       {:error, :unsupported}
     else
-      send_result(socket, :mob_midi_nif.midi_send(device_id, bytes))
+      result = :mob_midi_nif.midi_send(device_id, port(opts), bytes, timestamp(opts))
+      send_result(socket, result)
     end
   end
+
+  @doc """
+  The clock of MIDI timestamps, in nanoseconds: `CLOCK_MONOTONIC`
+  (`System.nanoTime()`) on Android, `mach_absolute_time` in ns on iOS. Use it
+  for `send_raw/4`'s `at:` and to compare with the `timestamp` / `received`
+  of incoming bytes. On the host (no MIDI stack) it is the BEAM's monotonic
+  clock.
+  """
+  @spec now_ns() :: integer()
+  def now_ns do
+    if MobMidi.Platform.unsupported?(MobMidi.Platform.current()),
+      do: System.monotonic_time(:nanosecond),
+      else: :mob_midi_nif.midi_now_ns()
+  end
+
+  @doc """
+  Subscribe to one of the app's own virtual MIDI devices, by name: a device
+  other apps on the phone see and play into (and listen to). The calling
+  process receives `{:midi, :opened, %{device: id, direction: :virtual,
+  name: name}}`, then what other apps send into it as `{:midi, :raw, ...}`
+  with that `device` id; `send_raw/4` to the id sends out of it to every app
+  listening (`{:error, :no_listener}` when none is).
+
+  On Android the app declares the device (see the README, "Virtual devices")
+  and also gets `{:midi, :virtual_status, %{device: id, senders: n,
+  listeners: n}}` whenever another app opens or closes it. On iOS
+  `open_virtual/2` creates a CoreMIDI source + destination of that name; iOS
+  doesn't report who is connected. `{:midi, :error, %{op: :open_virtual,
+  reason: :no_such_device}}` when Android has no such device of this app's.
+  """
+  @spec open_virtual(term(), String.t()) :: term()
+  def open_virtual(socket, name) when is_binary(name) do
+    guarded(socket, fn -> :mob_midi_nif.midi_open_virtual(name) end)
+  end
+
+  @doc """
+  Scan for BLE-MIDI devices (Android). Options: `duration_ms:` (default
+  10 000). The caller receives `{:midi, :bluetooth_scan, :started}`, one
+  `{:midi, :bluetooth_device, %{address: address, name: name}}` per device
+  found, and `{:midi, :bluetooth_scan, :stopped}`; or `{:midi, :error, %{op:
+  :scan_bluetooth, reason: :permission_denied | :unsupported | ...}}`.
+
+  Needs the `:midi_bluetooth` permission (`Mob.Permissions.request(socket,
+  :midi_bluetooth)`). iOS pairs BLE-MIDI devices through the system UI
+  (`CABTMIDICentralViewController`), after which they are ordinary devices:
+  `{:error, :unsupported}` there.
+  """
+  @spec scan_bluetooth(term(), keyword()) :: term()
+  def scan_bluetooth(socket, opts \\ []) do
+    duration = Keyword.get(opts, :duration_ms, 10_000)
+
+    bluetooth_guarded(socket, fn ->
+      :mob_midi_nif.midi_scan_bluetooth(duration)
+    end)
+  end
+
+  @doc "Stop a `scan_bluetooth/2` early (Android)."
+  @spec stop_bluetooth_scan(term()) :: term()
+  def stop_bluetooth_scan(socket),
+    do: bluetooth_guarded(socket, fn -> :mob_midi_nif.midi_stop_bluetooth_scan() end)
+
+  @doc """
+  Connect a BLE-MIDI device found by `scan_bluetooth/2` (Android). It then
+  appears in `list_devices/1` and opens like any other device; `close/2`
+  disconnects it. The caller receives `{:midi, :connected, %{device: id,
+  address: address}}` or `{:midi, :error, %{op: :connect_bluetooth, ...}}`.
+  """
+  @spec connect_bluetooth(term(), String.t()) :: term()
+  def connect_bluetooth(socket, address) when is_binary(address),
+    do: bluetooth_guarded(socket, fn -> :mob_midi_nif.midi_connect_bluetooth(address) end)
 
   # The NIF answers :ok (written), :queued (Android output still opening),
   # {:error, reason}, or a bare :error when it couldn't reach the JVM.
@@ -193,6 +303,25 @@ defmodule MobMidi do
   def send_result(socket, result) when result in [:ok, :queued], do: socket
   def send_result(_socket, {:error, reason}) when is_atom(reason), do: {:error, reason}
   def send_result(_socket, :error), do: {:error, :send_failed}
+
+  # `port:` / `at:` options, validated before they reach the NIF.
+  @doc false
+  @spec port(keyword()) :: non_neg_integer()
+  def port(opts) do
+    case Keyword.get(opts, :port, 0) do
+      p when is_integer(p) and p >= 0 -> p
+      other -> raise ArgumentError, "port must be a non-negative integer, got: #{inspect(other)}"
+    end
+  end
+
+  @doc false
+  @spec timestamp(keyword()) :: non_neg_integer()
+  def timestamp(opts) do
+    case Keyword.get(opts, :at, 0) do
+      t when is_integer(t) and t >= 0 -> t
+      other -> raise ArgumentError, "at must be a now_ns/0 timestamp, got: #{inspect(other)}"
+    end
+  end
 
   # ── Pure message encoders (testable; status nibble | channel) ───────────
 
@@ -269,7 +398,13 @@ defmodule MobMidi do
 
   @doc """
   Normalise a `{:midi, :devices, payload}` payload to a list of
-  `%{id: integer, name: binary, direction: :input | :output | :both}`.
+  `%{id: integer, name: binary, direction: :input | :output | :both,
+  manufacturer: binary, type: :usb | :bluetooth | :virtual | :other,
+  input_ports: n, output_ports: n, own: boolean}`.
+
+  `input_ports` counts the ports `open_input/3` can read (`port: 0..n-1`),
+  `output_ports` the ones `open_output/3` can write. `own` marks the app's own
+  virtual devices (see `open_virtual/2`), which a device picker usually hides.
 
   iOS delivers a list of maps directly; Android delivers a JSON string (the
   Kotlin bridge builds it from `MidiDeviceInfo`). This collapses both, so a
@@ -295,22 +430,45 @@ defmodule MobMidi do
   end
 
   defp atomize_device(d) when is_map(d) do
-    d = normalize_keys(d, [:id, :name, :direction])
+    d =
+      normalize_keys(d, [
+        :id,
+        :name,
+        :direction,
+        :manufacturer,
+        :type,
+        :input_ports,
+        :output_ports,
+        :own
+      ])
+
+    direction = direction_atom(d[:direction])
 
     %{
       id: d[:id],
       name: d[:name],
-      direction: direction_atom(d[:direction])
+      direction: direction,
+      manufacturer: d[:manufacturer] || "",
+      type: type_atom(d[:type]),
+      input_ports: d[:input_ports] || if(direction in [:input, :both], do: 1, else: 0),
+      output_ports: d[:output_ports] || if(direction in [:output, :both], do: 1, else: 0),
+      own: d[:own] == true
     }
   end
 
   # Devices arrive with atom keys (native bridge) or string keys (JSON);
-  # fill each atom key from its string twin when the atom value is missing.
+  # fill each atom key from its string twin when the atom key is missing.
   defp normalize_keys(d, keys) do
     Enum.reduce(keys, d, fn key, acc ->
-      if acc[key], do: acc, else: Map.put(acc, key, Map.get(acc, Atom.to_string(key)))
+      if Map.has_key?(acc, key),
+        do: acc,
+        else: Map.put(acc, key, Map.get(acc, Atom.to_string(key)))
     end)
   end
+
+  defp type_atom(t) when t in ["usb", "bluetooth", "virtual"], do: String.to_existing_atom(t)
+  defp type_atom(t) when t in [:usb, :bluetooth, :virtual], do: t
+  defp type_atom(_), do: :other
 
   defp direction_atom("input"), do: :input
   defp direction_atom("output"), do: :output
@@ -327,5 +485,11 @@ defmodule MobMidi do
       fun.()
       socket
     end
+  end
+
+  defp bluetooth_guarded(socket, fun) do
+    if MobMidi.Platform.bluetooth_central?(MobMidi.Platform.current()),
+      do: guarded(socket, fun),
+      else: {:error, :unsupported}
   end
 end
