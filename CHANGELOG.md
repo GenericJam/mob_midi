@@ -8,6 +8,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+
 The native C ABI (`priv/include/mob_midi.h`) on iOS, over CoreMIDI (MOB-543):
 Magpie's sampler, or any static NIF of an app, can send and receive MIDI
 without the BEAM on an iPhone as it does on Android.
