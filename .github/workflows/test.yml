@@ -2,9 +2,10 @@ name: tests
 
 # CI for the plugin's host-side Elixir surface — the same gate mob core runs,
 # so a PR gets a green check instead of relying only on each contributor's
-# local pre-push hook. Native code (zig/ObjC/Kotlin) is compiled by the host
-# app at deploy time, not here; the FFI-seam invariants are guarded by
-# source-level tests (see test/mob_camera_test.exs).
+# local pre-push hook. The Android native code (zig/Kotlin) is compiled by
+# the host app at deploy time, not here. The iOS NIF (ObjC over CoreMIDI)
+# also builds for macOS: the macos job compiles it and runs it against real
+# CoreMIDI (test/mob_midi_ios_host_test.exs, tagged :macos_only).
 
 on:
   push:
@@ -57,3 +58,29 @@ jobs:
 
       - name: Tests
         run: mix test --exclude macos_only --exclude requires_zig
+
+  macos:
+    name: iOS NIF on macOS CoreMIDI
+    runs-on: macos-15
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      # erlef/setup-beam has no macOS support.
+      - name: Install Erlang + Elixir
+        run: brew install elixir
+
+      - name: Cache deps + _build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-brew-${{ hashFiles('**/mix.lock') }}
+          restore-keys: mix-${{ runner.os }}-brew-
+
+      - run: mix local.hex --force && mix local.rebar --force
+      - run: mix deps.get
+      - name: Tests (CoreMIDI)
+        run: mix test --only macos_only

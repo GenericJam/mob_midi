@@ -1,8 +1,9 @@
 /*
- * mob_midi_queue.h: one output's send queue, for mob_midi_core.c.
+ * mob_midi_queue.h: one output's send queue, for both platforms' send paths
+ * (Android's mob_midi_core.c, iOS's ../ios/mob_midi_nif.m).
  *
- * Plain C with no JNI or ERTS, so test/c/mob_midi_queue_test.c runs it on the
- * host. The caller holds the output's lock around every call.
+ * Plain C with no JNI, CoreMIDI or ERTS, so test/c/mob_midi_queue_test.c
+ * runs it on the host. The caller holds the output's lock around every call.
  *
  * A min-heap of chunks ordered by (due, seq): messages leave in target-time
  * order, FIFO for equal times. Back-pressure follows a refuse-until-drained
@@ -17,8 +18,8 @@
  *
  * mob_midi_queue_discard() drops what is queued (stale notes a stalled
  * receiver would otherwise get late) and starts a new generation, which the
- * drained event reports. A batch the dispatcher already handed to Android
- * can't be recalled.
+ * drained event reports. A batch the dispatcher already handed to the
+ * platform can't be recalled.
  */
 #ifndef MOB_MIDI_QUEUE_H
 #define MOB_MIDI_QUEUE_H

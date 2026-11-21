@@ -31,12 +31,12 @@ Waiting for `:opened` is optional: Android opens the port asynchronously and
 queues sends made before it opens (up to 256 64-byte chunks per port), writing them in order
 the moment it does. If the open fails, the queue is discarded and the error's
 `dropped` counts the lost messages (`close/2` during the open reports `reason:
-:closed` the same way). `send_*` return `socket` when the message was written or
-queued and `{:error, reason}` when it wasn't (`:not_open`, `:queue_full`,
-`:no_such_device`, `:too_large` for one send over 256 bytes on iOS or 16 KiB on Android, `:send_failed`), so
-bind the result instead of piping it on as the socket.
+:closed` the same way). iOS opens synchronously. `send_*` return `socket` when
+the message was queued and `{:error, reason}` when it wasn't (`:not_open`,
+`:queue_full`, `:too_large` for one send over 16 KiB, `:no_listener`,
+`:send_failed`), so bind the result instead of piping it on as the socket.
 
-**Back-pressure (Android).** Sends join the port's queue and a thread of the
+**Back-pressure.** Sends join the port's queue and a thread of the
 port's own writes them, so a listener that stops reading never blocks the
 caller. When its queue is full, the send answers `{:error, :queue_full}` and
 the port refuses every send until it has drained (the stuck write returned,
@@ -44,18 +44,37 @@ at most half the queue is left and the largest refused message fits). The
 process that opened the port then gets
 `{:midi, :drained, %{device: id, port: n, handle: h, generation: g}}`.
 `MobMidi.discard(id, port: n)` drops what is still queued (stale notes the
-listener would otherwise play late) and returns `{:ok, generation}`; the next
-`:drained` carries it, or a later one (an own virtual output whose listeners
-all leave drops its queue too). The usual reaction to `:queue_full`: discard,
-wait for `:drained`, send note-offs or all-notes-off, then carry on.
+listener would otherwise play late, or sends scheduled ahead that shouldn't
+play) and returns `{:ok, generation}`; the next `:drained` carries it, or a
+later one (Android: an own virtual output whose listeners all leave drops its
+queue too). The usual reaction to `:queue_full`: discard, wait for
+`:drained`, send note-offs or all-notes-off, then carry on. CoreMIDI never
+makes a sender wait for a receiver, so on iOS only sends scheduled far ahead
+fill a queue.
 
 The NIF layer is deliberately thin (device enumeration + raw byte I/O); message
 encode/parse lives in Elixir (`MobMidi`) where it's pure and unit-tested.
 
 On-device self-test: `MobMidi.SelfTest` (declared as `selftest:` in the
-manifest) lists MIDI devices through the NIF; run it from a host app with
-`mix mob.selftest` (mob_dev 0.7.17+). No attached MIDI device is a
+manifest) lists MIDI devices through the NIF and, on iOS, loops a SysEx sent
+20 ms ahead through an own virtual device ("mob_midi selftest") and checks
+its bytes and timing; run it from a host app with `mix mob.selftest`
+(mob_dev 0.7.17+). On Android no attached MIDI device is a
 `:needs_hardware` skip.
+
+## Platforms
+
+| | Android | iOS | host (`mix test`) |
+|--|--|--|--|
+| `list_devices/1`, hot-plug | yes | yes | `{:error, :unsupported}` |
+| `open_input/3`, `open_output/3`, `send_*`, `at:` | yes | yes | `{:error, :unsupported}` |
+| `port:` other than 0, `port: :all` | yes | one port per endpoint | `{:error, :unsupported}` |
+| C ABI (`mob_midi.h`): `deliver: :native \| :both`, `output_handle/2`, `discard/2` | yes | yes | `{:error, :unsupported}` |
+| `:queue_full` / `:drained` | yes | yes (sends scheduled far ahead) | n/a |
+| `open_virtual/3` | declared in the app's manifest | made on first open | `{:error, :unsupported}` |
+| `{:midi, :virtual_status, ...}`, `:no_listener` | yes | no (CoreMIDI doesn't tell) | n/a |
+| `scan_bluetooth/2`, `connect_bluetooth/2` | yes | system UI pairs BLE-MIDI | `{:error, :unsupported}` |
+| `now_ns/0` | `CLOCK_MONOTONIC` | `mach_absolute_time` | BEAM monotonic time |
 
 ## Ports, timestamps, hot-plug
 
@@ -64,10 +83,13 @@ manifest) lists MIDI devices through the NIF; run it from a host app with
   `port:` (default 0). CoreMIDI endpoints are single ports.
 - **Timestamps**: incoming `{:midi, :raw, ...}` carries the sender's
   `timestamp` and when the bridge `received` it (ns on the `MobMidi.now_ns/0`
-  clock). `send_raw(socket, id, bytes, at: ns)` stamps outgoing bytes for when
-  the receiver should act on them: MIDI clock without the BEAM's timer jitter.
+  clock: `CLOCK_MONOTONIC` on Android, `mach_absolute_time` on iOS).
+  `send_raw(socket, id, bytes, at: ns)` holds outgoing bytes in the port's
+  queue until that time and hands them over stamped with it: MIDI clock
+  without the BEAM's timer jitter.
 - **Hot-plug**: the last `list_devices/1` caller gets `{:midi, :device_added |
-  :device_removed, nil}` on both platforms.
+  :device_removed, nil}` on both platforms; a removed device's open ports are
+  closed first.
 
 ## Virtual devices (the app as a MIDI device)
 
@@ -75,7 +97,13 @@ manifest) lists MIDI devices through the NIF; run it from a host app with
 devices: other apps on the phone see it, play into it (arriving as `{:midi,
 :raw, ...}`) and listen to what `send_raw/4` sends to its id.
 
-On iOS it creates a CoreMIDI source + destination of that name. On Android a
+On iOS the first `open_virtual/3` of a name creates a CoreMIDI source +
+destination of that name (the device id is the source's); they stay until the
+app exits, so other apps' connections survive a `close/2` and reopen.
+CoreMIDI doesn't say who is connected, so iOS sends no `:virtual_status` and
+its sends never answer `:no_listener`. iOS creates virtual endpoints only for an app whose
+`Info.plist` has `audio` in `UIBackgroundModes` (mob.new's template does);
+otherwise `open_virtual/3` answers `reason: :not_permitted`. On Android a
 virtual device is declared in the app's manifest (Android reads its name and
 ports from the app's own `res/xml`, so a plugin can't contribute a per-app
 one). Generate the declaration, which uses the plugin's
@@ -97,19 +125,27 @@ A second device needs its own `<service>`: declare an empty subclass of
 another app opens the device, possibly before the BEAM is up; bytes sent before
 `open_virtual/3` are dropped.
 
-## Native code (Android): `priv/include/mob_midi.h`
+## Native code: `priv/include/mob_midi.h`
 
 An audio engine in another static NIF of the app can take MIDI without the
-BEAM: open inputs with `deliver: :native` (or `:both`, per port), register a
-sink with `mob_midi_set_sink(fn, ctx)` and get `(source, generation, bytes,
-len, timestamp_ns)` on the MIDI thread; pass an output's `handle` (from
-`:opened` or `MobMidi.output_handle/2`) to it and call `mob_midi_send(handle,
-bytes, len, at_ns)` from its own thread. Sends wait in the port's queue until
-`at_ns` (the BEAM's `send_raw(..., at:)` shares that queue);
-`mob_midi_discard(handle)` drops what is queued. Include it relative to your
-source: `#include "../deps/mob_midi/priv/include/mob_midi.h"` (a path
-dependency: the dependency's own path).
-The header documents thread and lifetime rules;
+BEAM, on both platforms: open inputs with `deliver: :native` (or `:both`, per
+port), register a sink with `mob_midi_set_sink(fn, ctx)` and get `(source,
+generation, bytes, len, timestamp_ns)` on the MIDI thread; pass an output's
+`handle` (from `:opened` or `MobMidi.output_handle/2`) to it and call
+`mob_midi_send(handle, bytes, len, at_ns)` from its own thread. Sends wait in
+the port's queue until `at_ns` (the BEAM's `send_raw(..., at:)` shares that
+queue); `mob_midi_discard(handle)` drops what is queued. Include it relative
+to your source: `#include "../deps/mob_midi/priv/include/mob_midi.h"` (a
+path dependency: the dependency's own path). The symbols are in
+`priv/native/android/mob_midi_core.c` on Android and
+`priv/native/ios/mob_midi_nif.m` on iOS.
+
+The header documents thread and lifetime rules and the clock: on iOS every
+timestamp is `mach_absolute_time` in ns (CoreMIDI's `MIDITimeStamp`,
+`AudioTimeStamp.mHostTime`, `clock_gettime(CLOCK_UPTIME_RAW)`), not Darwin's
+`CLOCK_MONOTONIC`, which keeps counting while the phone sleeps: take times
+from `mob_midi_now_ns()`. iOS hands a due message to CoreMIDI from a
+real-time thread, so it leaves within tens of microseconds of `at_ns`.
 `priv/include/mob_midi_parser.h` is a matching header-only stream parser.
 
 ## Bluetooth MIDI devices (Android)

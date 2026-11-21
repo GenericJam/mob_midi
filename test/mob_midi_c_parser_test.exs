@@ -1,8 +1,10 @@
 defmodule MobMidi.CParserTest do
   # Compiles and runs the host C tests: test/c/mob_midi_parser_test.c against
-  # priv/include/mob_midi_parser.h, and test/c/mob_midi_queue_test.c against
-  # priv/native/android/mob_midi_queue.h (the Android send queue's
-  # back-pressure: refuse until drained, discard, generations).
+  # priv/include/mob_midi_parser.h, test/c/mob_midi_queue_test.c against
+  # priv/native/android/mob_midi_queue.h (both platforms' send queue:
+  # back-pressure, refuse until drained, discard, generations), and
+  # test/c/mob_midi_clock_test.c against priv/native/ios/mob_midi_clock.h
+  # (iOS host ticks <-> ns).
   # test_helper.exs excludes :requires_cc when there is no `cc` on the PATH.
   use ExUnit.Case, async: true
 
@@ -25,6 +27,11 @@ defmodule MobMidi.CParserTest do
   test "the send queue passes its host test", %{dir: dir} do
     {out, status} = run_c_test(dir, "mob_midi_queue_test", "priv/native/android")
     assert status == 0, "send queue test failed:\n" <> out
+  end
+
+  test "the iOS clock conversion passes its host test", %{dir: dir} do
+    {out, status} = run_c_test(dir, "mob_midi_clock_test", "priv/native/ios")
+    assert status == 0, "clock test failed:\n" <> out
   end
 
   # Compiles test/c/<name>.c (cc must succeed) and runs it: {output, exit status}.
