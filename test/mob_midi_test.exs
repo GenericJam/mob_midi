@@ -389,6 +389,21 @@ defmodule MobMidiTest do
       assert Mob.Plugin.SelfTest.result?(result)
     end
 
+    test "the iOS loop skips where iOS refuses virtual endpoints, and fails on any other open error" do
+      assert {:skip, why} = result = SelfTest.loop_error(:open_virtual, :not_permitted)
+      assert why =~ "UIBackgroundModes"
+      assert Mob.Plugin.SelfTest.result?(result)
+
+      for {op, reason} <- [
+            open_virtual: :open_failed,
+            open_virtual: :no_client,
+            open_input: :not_permitted
+          ] do
+        assert {:fail, msg} = SelfTest.loop_error(op, reason)
+        assert msg =~ "#{op} failed: #{inspect(reason)}"
+      end
+    end
+
     test "the iOS loop passes only for its bytes, stamped with their time and received no earlier" do
       at = 1_000_000_000
       loop = %{bytes: <<0xF0, 0x7D, 0x6D, 0x6D, 0xF7>>, timestamp: at + 41, received: at + 60_000}

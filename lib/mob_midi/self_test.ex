@@ -228,7 +228,7 @@ defmodule MobMidi.SelfTest do
         {:ok, source}
 
       {:midi, :error, %{op: op, reason: reason}} when op in [:open_virtual, :open_input] ->
-        {:fail, "loopback through #{inspect(@loop_name)}: #{op} failed: #{inspect(reason)}"}
+        loop_error(op, reason)
     after
       @answer_timeout ->
         {:fail, "loopback through #{inspect(@loop_name)}: no answer to opening #{inspect(what)}"}
@@ -266,4 +266,17 @@ defmodule MobMidi.SelfTest do
 
   def check_loop(_at, %{bytes: bytes}),
     do: {:fail, "loopback delivered #{inspect(bytes)}, sent #{inspect(@loop_bytes)}"}
+
+  @doc false
+  # A failed open of the loop: iOS refuses virtual endpoints to an app
+  # without "audio" in UIBackgroundModes, which says nothing about MIDI I/O.
+  @spec loop_error(atom(), atom()) :: Mob.Plugin.SelfTest.result()
+  def loop_error(:open_virtual, :not_permitted),
+    do:
+      {:skip,
+       "iOS refused a virtual MIDI device: the app's Info.plist has no \"audio\" in " <>
+         "UIBackgroundModes, so the loopback could not run"}
+
+  def loop_error(op, reason),
+    do: {:fail, "loopback through #{inspect(@loop_name)}: #{op} failed: #{inspect(reason)}"}
 end

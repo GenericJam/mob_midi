@@ -278,6 +278,26 @@ defmodule MobMidi.IosHostTest do
     Nif.peer_dispose()
   end
 
+  test "a SysEx sent at the same time as other messages arrives in packets of its own" do
+    {dest, _src} = peer("mm peer mixed")
+    handle = open_output(dest)
+    sysex = <<0xF0, 0x7D, 0x01, 0x02, 0xF7>>
+    at = Nif.c_now() + 20 * @ms
+    assert Nif.c_send(handle, <<0x90, 60, 100>>, at) == @ok
+    assert Nif.c_send(handle, sysex, at) == @ok
+    assert Nif.c_send(handle, <<0x80, 60, 0>>, at) == @ok
+    Process.sleep(100)
+
+    packets = Enum.map(Nif.peer_take(), fn {_, _, bytes, _, _, _} -> bytes end)
+    assert sysex in packets
+    # No other packet carries any of the SysEx, and the notes all arrive.
+    others = packets -- [sysex]
+    refute Enum.any?(others, &String.contains?(&1, <<0xF0>>))
+    assert IO.iodata_to_binary(others) == <<0x90, 60, 100, 0x80, 60, 0>>
+    close(dest)
+    Nif.peer_dispose()
+  end
+
   test "a message is never split or refused for its size up to 16 KiB, and too large beyond" do
     {dest, _src} = peer("mm peer sysex")
     handle = open_output(dest)

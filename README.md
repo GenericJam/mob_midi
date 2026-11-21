@@ -101,7 +101,9 @@ On iOS the first `open_virtual/3` of a name creates a CoreMIDI source +
 destination of that name (the device id is the source's); they stay until the
 app exits, so other apps' connections survive a `close/2` and reopen.
 CoreMIDI doesn't say who is connected, so iOS sends no `:virtual_status` and
-its sends never answer `:no_listener`. On Android a
+its sends never answer `:no_listener`. iOS creates virtual endpoints only for an app whose
+`Info.plist` has `audio` in `UIBackgroundModes` (mob.new's template does);
+otherwise `open_virtual/3` answers `reason: :not_permitted`. On Android a
 virtual device is declared in the app's manifest (Android reads its name and
 ports from the app's own `res/xml`, so a plugin can't contribute a per-app
 one). Generate the declaration, which uses the plugin's

@@ -341,6 +341,15 @@ static void source_close(int source) {
   pthread_mutex_unlock(&g_sources_lock);
 }
 
+/* Who gets an open source's bytes from now on (0: nobody, while it opens). */
+static void source_route(int64_t packed, uint32_t route) {
+  source_t *s = &g_sources[packed >> 32];
+  pthread_mutex_lock(&s->lock);
+  if (s->used && s->generation == (uint32_t)packed)
+    s->route = route;
+  pthread_mutex_unlock(&s->lock);
+}
+
 /* {:midi, :raw, %{device, port, bytes, timestamp, received}}; from
  * CoreMIDI's thread, under the source's lock. */
 static void deliver_beam(const source_t *s, const uint8_t *bytes, size_t len,
@@ -580,13 +589,42 @@ static void set_realtime(void) {
                     THREAD_TIME_CONSTRAINT_POLICY_COUNT);
 }
 
+/* The end of the segment of a batch that starts at `i`: a SysEx (from 0xF0,
+ * or the rest of one when a batch starts with data bytes) up to its 0xF7 or
+ * the next status byte, or anything else up to the next 0xF0. CoreMIDI wants
+ * a SysEx alone in its packets (MIDIPacket.data); real-time bytes inside one
+ * stay in it. */
+static int segment_end(const uint8_t *b, int n, int i) {
+  int k = i + 1;
+  if (!(b[i] == 0xF0 || (i == 0 && b[i] < 0x80))) {
+    while (k < n && b[k] != 0xF0)
+      k++;
+    return k;
+  }
+  for (; k < n; k++) {
+    if (b[k] == 0xF7)
+      return k + 1;
+    if (b[k] >= 0x80 && b[k] < 0xF8)
+      return k;
+  }
+  return k;
+}
+
+static void hand_over(MIDIEndpointRef endpoint, bool virtual_port,
+                      const MIDIPacketList *packets) {
+  if (virtual_port)
+    MIDIReceived(endpoint, packets);
+  else
+    MIDISend(g_out_port, endpoint, packets);
+}
+
 /* One per open output, so a send that misbehaves holds up only its own
  * queue. Ends when the output closes. */
 static void *dispatcher_main(void *arg) {
   mob_midi_port handle = (mob_midi_port)(intptr_t)arg;
   pthread_setname_np("mob_midi_out");
   set_realtime();
-  _Static_assert(DISPATCH_MAX < 65536, "one MIDIPacket holds the batch");
+  _Static_assert(DISPATCH_MAX < 65536, "one MIDIPacket holds a segment");
   uint8_t out[DISPATCH_MAX];
   uint8_t list[DISPATCH_MAX + 64] __attribute__((aligned(8)));
   for (;;) {
@@ -596,16 +634,27 @@ static void *dispatcher_main(void *arg) {
     int n = next_send(handle, out, &stamp, &endpoint, &virtual_port);
     if (n < 0)
       return NULL;
+    // A packet per segment (MIDIPacketListAdd joins same-time segments that
+    // aren't SysEx); a full list goes out and a new one starts.
+    MIDITimeStamp ts = ns_to_host(stamp);
     MIDIPacketList *packets = (MIDIPacketList *)list;
     MIDIPacket *p = MIDIPacketListInit(packets);
-    p = MIDIPacketListAdd(packets, sizeof(list), p, ns_to_host(stamp),
-                          (ByteCount)n, out);
-    if (!p)
-      continue;
-    if (virtual_port)
-      MIDIReceived(endpoint, packets);
-    else
-      MIDISend(g_out_port, endpoint, packets);
+    for (int i = 0; i < n;) {
+      int end = segment_end(out, n, i);
+      MIDIPacket *next = MIDIPacketListAdd(packets, sizeof(list), p, ts,
+                                           (ByteCount)(end - i), out + i);
+      if (!next && packets->numPackets > 0) {
+        hand_over(endpoint, virtual_port, packets);
+        p = MIDIPacketListInit(packets);
+        next = MIDIPacketListAdd(packets, sizeof(list), p, ts,
+                                 (ByteCount)(end - i), out + i);
+      }
+      if (next)
+        p = next;
+      i = end;
+    }
+    if (packets->numPackets > 0)
+      hand_over(endpoint, virtual_port, packets);
   }
 }
 
@@ -1045,19 +1094,19 @@ static ERL_NIF_TERM nif_open_input(ErlNifEnv *env, int argc,
     failure = "no_such_port";
   if (!failure) {
     close_inputs((int32_t)uid);
-    int64_t packed = source_open(SRC_INPUT, (int32_t)uid, 0, &self,
-                                 (uint32_t)route, src);
+    // Delivering to nobody until :opened is out: no bytes precede it, and a
+    // connect that fails sends no :opened.
+    int64_t packed = source_open(SRC_INPUT, (int32_t)uid, 0, &self, 0, src);
     if (packed < 0) {
       failure = "no_free_source";
+    } else if (MIDIPortConnectSource(g_in_port, src,
+                                     (void *)(uintptr_t)packed) != noErr) {
+      source_close((int)(packed >> 32));
+      failure = "open_failed";
     } else {
-      // :opened first, so no bytes precede it.
       send_opened(env, &self, (SInt32)uid, "input", (uint32_t)(packed >> 32),
                   0);
-      if (MIDIPortConnectSource(g_in_port, src,
-                                (void *)(uintptr_t)packed) != noErr) {
-        source_close((int)(packed >> 32));
-        failure = "open_failed";
-      }
+      source_route(packed, (uint32_t)route);
     }
   }
   pthread_mutex_unlock(&g_ops);
@@ -1218,9 +1267,14 @@ static virtual_t *virtual_named(const ErlNifBinary *name, const char **reason) {
     return NULL;
   }
   MIDIEndpointRef src = 0, dst = 0;
-  if (MIDISourceCreate(g_client, cf, &src) != noErr ||
-      MIDIDestinationCreate(g_client, cf, virtual_read_proc, v, &dst) !=
-          noErr) {
+  OSStatus st = MIDISourceCreate(g_client, cf, &src);
+  if (st == noErr)
+    st = MIDIDestinationCreate(g_client, cf, virtual_read_proc, v, &dst);
+  if (st != noErr) {
+    // iOS refuses virtual endpoints to an app without "audio" in its
+    // Info.plist UIBackgroundModes.
+    if (st == kMIDINotPermitted)
+      *reason = "not_permitted";
     if (src)
       MIDIEndpointDispose(src);
     CFRelease(cf);

@@ -246,12 +246,12 @@ defmodule MobMidi do
   same `port:`.
 
   The calling process receives `{:midi, :opened, %{device: id, port: port,
-  direction: :output, handle: h}}` when the port is ready (`handle` on
-  Android: see `output_handle/2`), or `{:midi, :error, %{device: id, op:
-  :open_output, reason: reason, dropped: n}}` when it can't be opened
-  (reasons include `:no_such_device`, `:no_such_port`, `:open_failed`,
-  `:no_input_port` (another app has the port), `:no_free_output`, and
-  `:closed` when `close/2` cancels an open still in flight). Sends made
+  direction: :output, handle: h}}` when the port is ready (`handle`: see
+  `output_handle/2`), or `{:midi, :error, %{device: id, op: :open_output,
+  reason: reason, dropped: n}}` when it can't be opened (reasons include
+  `:no_such_device`, `:no_such_port`, `:open_failed`, `:no_input_port`
+  (Android: another app has the port), `:no_free_output`, and `:closed`
+  when `close/2` cancels an open still in flight). On Android sends made
   before `:opened` are queued and flushed in order; see "Sending" above.
   """
   @spec open_output(term(), device_id(), keyword()) :: term()
@@ -346,7 +346,10 @@ defmodule MobMidi do
   device id is the source's); CoreMIDI doesn't report who is connected, so
   there is no `:virtual_status` and no `:no_listener`. `{:midi, :error,
   %{op: :open_virtual, reason: :no_such_device}}` when Android has no such
-  device of this app's. A second `open_virtual/3` replaces the first, and
+  device of this app's; `reason: :not_permitted` when iOS refuses the
+  endpoints because the app's `Info.plist` has no `audio` in
+  `UIBackgroundModes` (mob.new's template has it). A second
+  `open_virtual/3` replaces the first, and
   `close/2` on the id ends it (iOS keeps the CoreMIDI endpoints until the
   app exits, so other apps' connections to them survive a reopen).
   """
