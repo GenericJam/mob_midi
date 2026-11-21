@@ -249,9 +249,9 @@ defmodule MobMidiTest do
       refute MobMidi.Platform.bluetooth_central?(:host)
     end
 
-    test "the native C path (sink, output handles) is Android-only" do
+    test "the native C path (sink, output handles, discard) is on both platforms, not the host" do
       assert MobMidi.Platform.native_abi?(:android)
-      refute MobMidi.Platform.native_abi?(:ios)
+      assert MobMidi.Platform.native_abi?(:ios)
       refute MobMidi.Platform.native_abi?(:host)
     end
 
@@ -387,6 +387,24 @@ defmodule MobMidiTest do
                result = SelfTest.classify(:ok, 0)
 
       assert Mob.Plugin.SelfTest.result?(result)
+    end
+
+    test "the iOS loop passes only for its bytes, stamped with their time and received no earlier" do
+      at = 1_000_000_000
+      loop = %{bytes: <<0xF0, 0x7D, 0x6D, 0x6D, 0xF7>>, timestamp: at + 41, received: at + 60_000}
+      assert SelfTest.check_loop(at, loop) == :pass
+
+      for {bad, why} <- [
+            {%{loop | bytes: <<0x90, 60, 1>>}, "loopback delivered"},
+            {%{loop | timestamp: at - 1}, "loopback stamped"},
+            {%{loop | timestamp: at + 2_000}, "loopback stamped"},
+            {%{loop | received: at - 1}, "loopback received 1 ns before"},
+            {%{loop | received: at + 600_000_000}, "loopback received 600 ms after"}
+          ] do
+        assert {:fail, reason} = result = SelfTest.check_loop(at, bad)
+        assert String.starts_with?(reason, why)
+        assert Mob.Plugin.SelfTest.result?(result)
+      end
     end
   end
 end

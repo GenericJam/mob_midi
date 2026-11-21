@@ -26,28 +26,28 @@ defmodule MobMidi do
 
   Hot-plug: a device appearing / disappearing sends `{:midi, :device_added,
   nil}` / `{:midi, :device_removed, nil}` to the last `list_devices/1` caller,
-  on both platforms; re-list on either. On Android a removed device's open
-  ports are closed.
+  on both platforms; re-list on either. A removed device's open ports are
+  closed first, as if by `close/2`.
 
   ## Receiving
 
       MobMidi.open_input(socket, device_id)              # port 0
       MobMidi.open_input(socket, device_id, port: 1)     # a multi-port device
-      MobMidi.open_input(socket, device_id, port: :all)  # every port (Android)
+      MobMidi.open_input(socket, device_id, port: :all)  # every port
 
   Each opened port answers `{:midi, :opened, %{device: id, port: n,
-  direction: :input, source: s}}` (`source` on Android: its id in the native
-  ABI, see "Native code" below), then its incoming MIDI is delivered to the
-  calling process as raw packets:
+  direction: :input, source: s}}` (`source`: its id in the native ABI, see
+  "Native code" below), then its incoming MIDI is delivered to the calling
+  process as raw packets:
 
       {:midi, :raw, %{device: id, port: 0, bytes: <<0x90, 60, 100>>,
                       timestamp: sent_ns, received: received_ns}}
 
   After `close/2` returns, no further bytes of the closed port are sent, not
-  even ones its MIDI thread was already delivering (Android), and no
-  `:opened` of an open asked for before the close is still to come (an open
-  still in flight answers `{:midi, :error, %{reason: :closed}}`); messages
-  already in the mailbox stay there.
+  even ones its MIDI thread was already delivering, and no `:opened` of an
+  open asked for before the close is still to come (an open still in flight
+  answers `{:midi, :error, %{reason: :closed}}`); messages already in the
+  mailbox stay there.
 
   Parse it with `parse/1` (pure, so it's unit-testable and you decide how much
   to decode):
@@ -67,8 +67,8 @@ defmodule MobMidi do
 
   Open the output first. `open_output/2` replies to the calling process with
   `{:midi, :opened, %{device: id, port: n, direction: :output, handle: h}}`
-  once the port is ready (`handle`: Android, for native code; see "Native
-  code"), or `{:midi, :error, %{device: id, op: :open_output, reason: reason,
+  once the port is ready (`handle`: for native code, see "Native code"), or
+  `{:midi, :error, %{device: id, op: :open_output, reason: reason,
   dropped: n}}` if it can't be opened:
 
       MobMidi.open_output(socket, device_id)
@@ -91,10 +91,12 @@ defmodule MobMidi do
   discarded and the error event's `dropped` says how many messages were lost.
   iOS opens synchronously, so the event arrives before `open_output/2` returns.
 
-  On Android a send doesn't write to the port itself: it joins the port's
-  queue (ordered by `at:`, at most 256 chunks of 64 bytes), and a thread of
-  the port's own writes it, so a receiver that stops reading never blocks the
-  caller: its queue fills and sends answer `{:error, :queue_full}`.
+  A send doesn't write to the port itself: it joins the port's queue
+  (ordered by `at:`, at most 256 chunks of 64 bytes), and a thread of the
+  port's own writes it, so a receiver that stops reading never blocks the
+  caller: its queue fills and sends answer `{:error, :queue_full}`. (iOS
+  hands CoreMIDI bytes without waiting on the receiver, so there only sends
+  scheduled far ahead fill it.)
 
   Once a send has answered `{:error, :queue_full}`, the port refuses every
   send until its queue has drained (the receiver took the write it was stuck
@@ -106,37 +108,39 @@ defmodule MobMidi do
 
   What is still queued at a refusal is usually stale (notes a stalled
   receiver would play late): `discard/2` drops it and starts a new queue
-  `generation`, which the drained event carries (or a later one: an own
-  virtual output whose listeners all leave drops its queue too). So an app
-  that sees `:queue_full` can discard, wait for `:drained`, then send what
-  releases the receiver's notes before anything new.
+  `generation`, which the drained event carries (or a later one: on Android
+  an own virtual output whose listeners all leave drops its queue too). So an
+  app that sees `:queue_full` can discard, wait for `:drained`, then send
+  what releases the receiver's notes before anything new.
 
   `send_*` return `socket` when the message was queued, and `{:error,
   reason}` when it wasn't: `:not_open` (no `open_output/2` for that device, or
-  it was closed or failed to open), `:queue_full`, `:no_such_device` (iOS: the
-  destination disappeared), `:too_large` (one send over 256 bytes on iOS, over 16 KiB on Android),
-  `:no_listener` (a virtual device nobody listens to) or `:send_failed`;
-  `{:error, :unsupported}` on the host and `{:error, :nif_not_loaded}` if the
-  native bridge isn't registered. So bind the result rather than piping it on
-  as the socket.
+  it was closed, failed to open or went away), `:queue_full`, `:too_large`
+  (one send over 16 KiB), `:no_listener` (Android: a virtual device nobody
+  listens to) or `:send_failed`; `{:error, :unsupported}` on the host and
+  `{:error, :nif_not_loaded}` if the native bridge isn't registered. So bind
+  the result rather than piping it on as the socket.
 
   Channels are `0..15` on the wire (shown as 1..16 in most UIs). Notes /
   velocities / values are `0..127`.
 
   ## Timing
 
-  `now_ns/0` is the clock of MIDI timestamps. Incoming packets carry the
-  sender's `timestamp` and when the bridge `received` them, so an app can see
-  what delivery costs. `send_raw/4` with `at:` sends at that time: Android
-  holds the bytes in the port's queue until then and hands them over stamped
-  with it (iOS schedules the CoreMIDI packet), which takes the BEAM's
-  scheduling jitter out of MIDI clock, as long as the send is made ahead.
+  `now_ns/0` is the clock of MIDI timestamps: `CLOCK_MONOTONIC` ns on
+  Android, `mach_absolute_time` in ns on iOS (`CLOCK_UPTIME_RAW`, not
+  Darwin's `CLOCK_MONOTONIC`; see the header's Clock section). Incoming
+  packets carry the sender's `timestamp` and when the bridge `received`
+  them, so an app can see what delivery costs. `send_raw/4` with `at:` sends
+  at that time: the port's queue holds the bytes until then and hands them
+  over stamped with it (iOS: from a real-time thread, within tens of
+  microseconds), which takes the BEAM's scheduling jitter out of MIDI clock,
+  as long as the send is made ahead.
 
   ## Native code
 
   Another native library in the app (an audio engine's static NIF) can take
-  MIDI without the BEAM, through the C ABI in `priv/include/mob_midi.h`
-  (Android; on iOS its functions answer "unsupported"):
+  MIDI without the BEAM, through the C ABI in `priv/include/mob_midi.h`, on
+  both platforms:
 
     * open inputs with `deliver: :native` (or `:both`) and register a sink
       with `mob_midi_set_sink/2`: it gets `(source, generation, bytes, len,
@@ -145,7 +149,22 @@ defmodule MobMidi do
       and call `mob_midi_send(handle, bytes, len, at_ns)` from its own thread.
 
   `priv/include/mob_midi_parser.h` is a matching header-only stream parser.
-  The header documents thread and lifetime rules.
+  The header documents thread and lifetime rules, and the clock.
+
+  ## Platforms
+
+  | | Android | iOS | host (`mix test`) |
+  |--|--|--|--|
+  | `list_devices/1`, hot-plug | yes | yes | `{:error, :unsupported}` |
+  | `open_input/3`, `open_output/3`, `send_*`, `at:` | yes | yes | `{:error, :unsupported}` |
+  | `port:` other than 0, `port: :all` | yes | one port per endpoint | `{:error, :unsupported}` |
+  | `deliver: :native \\| :both`, `output_handle/2`, `discard/2`, C ABI | yes | yes | `{:error, :unsupported}` |
+  | `:queue_full` / `:drained` | yes | yes (sends scheduled far ahead) | n/a |
+  | `open_virtual/3` | declared in the app's manifest | made on first open | `{:error, :unsupported}` |
+  | `{:midi, :virtual_status, ...}`, `:no_listener` | yes | no (CoreMIDI doesn't tell) | n/a |
+  | `scan_bluetooth/2`, `connect_bluetooth/2` | yes | system UI pairs BLE-MIDI | `{:error, :unsupported}` |
+  | `now_ns/0` | `CLOCK_MONOTONIC` | `mach_absolute_time` | BEAM monotonic time |
+  | `MobMidi.SelfTest` | lists devices | lists devices, loops through an own virtual device | n/a |
 
   ## Virtual devices
 
@@ -201,7 +220,7 @@ defmodule MobMidi do
     * `deliver:` who gets the bytes: `:beam` (default, `{:midi, :raw, ...}`
       messages to the calling process), `:native` (the sink a native library
       registered with `mob_midi_set_sink`, see "Native code" in the module
-      doc; no messages) or `:both`. Android only for anything but `:beam`.
+      doc; no messages) or `:both`.
 
   The calling process receives `{:midi, :opened, %{device: id, port: port,
   direction: :input, source: s}}` per port, then each incoming packet as
@@ -275,11 +294,10 @@ defmodule MobMidi do
   Send raw MIDI bytes (SysEx, or anything `send_*` doesn't cover).
 
   Options: `port:` (default 0, see `open_output/3`) and `at:`, a `now_ns/0`
-  timestamp of when the bytes should be acted on (default: now). Android
-  keeps them in the port's queue until then and hands them over stamped with
-  it; iOS schedules the CoreMIDI packet. Sending ahead with `at:` takes the
-  BEAM's scheduling jitter out of timing that matters, such as MIDI clock. A
-  time already past sends at once.
+  timestamp of when the bytes should be acted on (default: now). The port's
+  queue keeps them until then and hands them over stamped with it. Sending
+  ahead with `at:` takes the BEAM's scheduling jitter out of timing that
+  matters, such as MIDI clock. A time already past sends at once.
 
   Returns `socket` when the bytes were queued (or held while the output is
   still opening); `{:error, reason}` when they weren't (see "Sending" above).
@@ -315,20 +333,22 @@ defmodule MobMidi do
   process receives `{:midi, :opened, %{device: id, direction: :virtual,
   name: name}}`, then what other apps send into it as `{:midi, :raw, ...}`
   with that `device` id; `send_raw/4` to the id (and `port:`) sends out of it
-  to every app listening (`{:error, :no_listener}` when none is), and
-  `output_handle/2` gives native code the same.
+  to every app listening (Android: `{:error, :no_listener}` when none is),
+  and `output_handle/2` gives native code the same.
 
   Options: `deliver:` as for `open_input/3`, for what other apps send in.
 
   On Android the app declares the device (see the README, "Virtual devices";
   `mix mob_midi.gen.virtual_device` writes the declaration) and also gets
   `{:midi, :virtual_status, %{device: id, senders: n, listeners: n}}`
-  whenever another app opens or closes it. On iOS `open_virtual/3` creates a
-  CoreMIDI source + destination of that name; iOS doesn't report who is
-  connected. `{:midi, :error, %{op: :open_virtual, reason: :no_such_device}}`
-  when Android has no such device of this app's. A second `open_virtual/3`
-  replaces the first; on Android `close/2` on the id ends it (iOS keeps
-  the CoreMIDI endpoints until the app exits).
+  whenever another app opens or closes it. On iOS the first `open_virtual/3`
+  of a name creates a CoreMIDI source + destination of that name (the
+  device id is the source's); CoreMIDI doesn't report who is connected, so
+  there is no `:virtual_status` and no `:no_listener`. `{:midi, :error,
+  %{op: :open_virtual, reason: :no_such_device}}` when Android has no such
+  device of this app's. A second `open_virtual/3` replaces the first, and
+  `close/2` on the id ends it (iOS keeps the CoreMIDI endpoints until the
+  app exits, so other apps' connections to them survive a reopen).
   """
   @spec open_virtual(term(), String.t(), keyword()) :: term()
   def open_virtual(socket, name, opts \\ []) when is_binary(name) do
@@ -337,12 +357,12 @@ defmodule MobMidi do
   end
 
   @doc """
-  The native handle of an open output (Android): `{:ok, handle}` for the C
-  ABI's `mob_midi_send` (see "Native code"), `{:error, :not_open}` when
+  The native handle of an open output: `{:ok, handle}` for the C ABI's
+  `mob_midi_send` (see "Native code"), `{:error, :not_open}` when
   `device_id`'s `port:` (default 0) isn't open (yet), `{:error,
-  :unsupported}` elsewhere. Outputs of the app's own virtual device have one
-  from `open_virtual/3` on. A handle dies with its port: reopening gives a
-  new one.
+  :unsupported}` on the host. Outputs of the app's own virtual device have
+  one from `open_virtual/3` on. A handle dies with its port: reopening gives
+  a new one.
   """
   @spec output_handle(device_id(), keyword()) :: {:ok, pos_integer()} | {:error, atom()}
   def output_handle(device_id, opts \\ []) when is_integer(device_id) do
@@ -352,17 +372,18 @@ defmodule MobMidi do
   end
 
   @doc """
-  Drop everything queued for an open output (Android): `device_id`'s `port:`
+  Drop everything queued for an open output: `device_id`'s `port:`
   (default 0), an output of `open_output/3` or of the app's own virtual
   device. Returns `{:ok, generation}`, the port's new queue generation, which
   the next `{:midi, :drained, ...}` carries (or a later one);
   `{:error, :not_open}` when the port isn't open (yet); `{:error,
-  :unsupported}` elsewhere.
+  :unsupported}` on the host.
 
-  Meant for a port that answered `{:error, :queue_full}`: what it still
-  holds would reach a stalled receiver late. A port that is refusing sends
-  keeps refusing until it has drained, so wait for `:drained` before sending
-  again. Bytes the port's thread already handed to Android aren't recalled.
+  Meant for a port that answered `{:error, :queue_full}`, or for sends
+  scheduled ahead that should no longer play: what it still holds would
+  reach the receiver late. A port that is refusing sends keeps refusing
+  until it has drained, so wait for `:drained` before sending again. Bytes
+  the port's thread already handed to the platform aren't recalled.
   """
   @spec discard(device_id(), keyword()) :: {:ok, pos_integer()} | {:error, atom()}
   def discard(device_id, opts \\ []) when is_integer(device_id) do
@@ -613,7 +634,7 @@ defmodule MobMidi do
       else: {:error, :unsupported}
   end
 
-  # Anything but deliver: :beam needs the C ABI (Android).
+  # Anything but deliver: :beam needs the C ABI (not on the host).
   defp native_guarded(socket, route, fun) do
     platform = MobMidi.Platform.current()
 

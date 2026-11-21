@@ -8,6 +8,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+The native C ABI (`priv/include/mob_midi.h`) on iOS, over CoreMIDI (MOB-543):
+Magpie's sampler, or any static NIF of an app, can send and receive MIDI
+without the BEAM on an iPhone as it does on Android.
+
+### Added
+- **`mob_midi.h` on iOS** (`priv/native/ios/mob_midi_nif.m`), with Android's
+  semantics: `mob_midi_set_sink`, `mob_midi_source_info`, `mob_midi_send`,
+  `mob_midi_discard` and `mob_midi_now_ns` work instead of answering
+  `MOB_MIDI_ERR_UNSUPPORTED`. Every opened input (`open_input/3`, or the
+  destination of an own virtual device) is a source with a generation,
+  delivered from CoreMIDI's receive thread under the source's lock and
+  dropped once it is closed. Every open output (a destination, or the own
+  virtual source) has a handle and the same queue as Android
+  (`priv/native/android/mob_midi_queue.h`: 256 chunks, ordered by `at:`,
+  refuse-until-drained, `:drained`, `discard/2` generations, 16 KiB
+  messages), emptied by a dispatch thread per output with real-time
+  (time-constraint) scheduling that hands each message to `MIDISend` /
+  `MIDIReceived` at its time, stamped with it. Measured on the iOS 27
+  simulator: 200 sends 5 ms ahead arrived 11–113 µs after their time
+  (median 25 µs), never early; stamps exact to the ns.
+- On iOS `deliver: :native | :both`, `output_handle/2` and `discard/2`
+  work; input `{:midi, :opened, ...}` carries `source`, output `:opened`
+  carries `handle`, and `{:midi, :drained, ...}` reaches the opener.
+- `MobMidi.SelfTest` on iOS loops a SysEx sent 20 ms ahead through an own
+  virtual device ("mob_midi selftest") and checks its bytes, stamp and
+  arrival; a pass there passes the self-test without MIDI hardware.
+- `priv/native/ios/mob_midi_clock.h`: the iOS clock (host ticks <-> ns,
+  128-bit, ns rounded up so a message is never handed over early), with a
+  host C test. The header's Clock section names both platforms' clocks.
+- `test/mob_midi_ios_host_test.exs`: the iOS NIF built for macOS and run
+  against real CoreMIDI (loopbacks through own virtual devices and a peer
+  client, the C ABI, `MobMidi` and `MobMidi.SelfTest` with the platform set
+  to `:ios`); CI runs it on a macOS runner.
+
+### Changed
+- **iOS hot-plug works**: CoreMIDI calls a client's notify proc on the run
+  loop of the thread that first made a client in the process, and the client
+  was made on a BEAM scheduler, which runs none, so `{:midi, :device_added |
+  :device_removed, nil}` never arrived. The client is now made on a
+  `mob_midi` thread that runs a run loop. A removed device's open ports are
+  closed before `:device_removed` is sent, as on Android.
+- iOS `send_*` go through the port's queue: `:too_large` is over 16 KiB (was
+  256 bytes), and a send to a destination that went away answers
+  `:not_open` (was `:no_such_device`).
+- iOS input bytes go to each port's opener (was: the last `open_input/3`
+  caller got every port's bytes); reopening an input replaces its
+  subscription.
+- iOS sends to an own virtual device answer `:not_open` after `close/2` on
+  it, until the next `open_virtual/3`.
+
 ## [0.3.0] - 2026-11-13
 
 Consolidation (stacked on the entries below, from #5): mob_midi becomes the one

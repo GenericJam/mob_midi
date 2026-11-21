@@ -3,11 +3,23 @@ defmodule MobMidi.SelfTest do
   The plugin's on-device proof (`Mob.Plugin.SelfTest`), run by
   `mix mob.selftest` and mob_ci for every activated plugin.
 
-  One native round trip, read-only, no UI: `:mob_midi_nif.midi_list_devices/0`,
+  Step one, on both platforms, read-only: `:mob_midi_nif.midi_list_devices/0`,
   then wait for what the native side sends back to the caller. Both platforms
   answer before the NIF returns (iOS enumerates CoreMIDI endpoints in the
   NIF; Android calls `MobMidiBridge.listDevices` over JNI on the calling
   thread), so the wait is short.
+
+  Step two, on iOS, a loop through the app's own virtual device (Android
+  can't make one without the host's declaration): `midi_open_virtual/2`
+  makes "mob_midi selftest", `midi_open_input/3` subscribes to its source,
+  `midi_output_handle/2` must give its output a native handle, and a short
+  SysEx sent 20 ms ahead (`at:`) must come back as `{:midi, :raw, ...}`
+  with its bytes, stamped with that time and received no earlier. That
+  exercises the send queue and its dispatch thread, CoreMIDI, the receive
+  path with its source and generation, and the clock, which the C ABI of
+  `priv/include/mob_midi.h` shares with the BEAM path. It then closes the
+  device; CoreMIDI keeps the endpoints until the app exits. A pass there
+  makes the whole result `:pass` even with no MIDI hardware attached.
 
   The NIF's return value:
 
@@ -43,21 +55,37 @@ defmodule MobMidi.SelfTest do
     * A malformed device list, another error reason, or no answer within
       5 s — failure.
 
-  State: on iOS `midi_list_devices/0` makes the caller the hot-plug
-  subscriber (`{:midi, :device_added | :device_removed, nil}`, last caller
-  wins), as `MobMidi.list_devices/1` does; the next `list_devices` from a
-  screen takes it back. Nothing is opened, sent or written. Stale list
-  answers already in the caller's mailbox are flushed before the call, so
-  only this call's answer is classified.
+  State: `midi_list_devices/0` makes the caller the hot-plug subscriber
+  (`{:midi, :device_added | :device_removed, nil}`, last caller wins), as
+  `MobMidi.list_devices/1` does; the next `list_devices` from a screen takes
+  it back. On Android nothing is opened, sent or written; on iOS the loop
+  above leaves an idle "mob_midi selftest" virtual device that nothing is
+  subscribed to. Stale list answers already in the caller's mailbox are
+  flushed before the call, so only this call's answer is classified.
   """
   @behaviour Mob.Plugin.SelfTest
 
   @answer_timeout 5_000
 
+  @loop_name "mob_midi selftest"
+  # SysEx with the non-commercial manufacturer id 0x7D: nothing acts on it.
+  @loop_bytes <<0xF0, 0x7D, 0x6D, 0x6D, 0xF7>>
+  @loop_lead_ns 20_000_000
+  # Received this long after its time at the latest (a loaded simulator).
+  @loop_late_ns 500_000_000
+  # A stamp converted to CoreMIDI ticks and back is up to a tick late.
+  @tick_ns 1_000
+
   @impl true
-  def run(_ctx) do
+  def run(ctx) do
     flush_answers()
-    classify(:mob_midi_nif.midi_list_devices(), @answer_timeout)
+    listed = classify(:mob_midi_nif.midi_list_devices(), @answer_timeout)
+
+    case {listed, ctx[:platform]} do
+      {{:fail, _}, _} -> listed
+      {_, :ios} -> loopback()
+      _ -> listed
+    end
   catch
     :error, :nif_not_loaded ->
       {:fail,
@@ -155,4 +183,87 @@ defmodule MobMidi.SelfTest do
 
   defp classify_error(reason),
     do: {:fail, "midi_list_devices/0 delivered error #{inspect(reason)}"}
+
+  # ── iOS: a loop through an own virtual device ──────────────────────────
+
+  defp loopback do
+    :mob_midi_nif.midi_open_virtual(@loop_name, 1)
+
+    case await_opened(:virtual) do
+      {:ok, id} ->
+        try do
+          loop_through(id)
+        after
+          :mob_midi_nif.midi_close(id)
+        end
+
+      fail ->
+        fail
+    end
+  end
+
+  defp loop_through(id) do
+    :mob_midi_nif.midi_open_input(id, 0, 1)
+
+    with {:ok, _source} <- await_opened({:input, id}),
+         {:ok, handle} when is_integer(handle) and handle > 0 <-
+           :mob_midi_nif.midi_output_handle(id, 0),
+         at = :mob_midi_nif.midi_now_ns() + @loop_lead_ns,
+         :ok <- :mob_midi_nif.midi_send(id, 0, @loop_bytes, at) do
+      await_loop(id, at)
+    else
+      {:fail, _} = fail -> fail
+      other -> {:fail, "loopback through #{inspect(@loop_name)}: #{inspect(other)}"}
+    end
+  end
+
+  defp await_opened(what) do
+    receive do
+      {:midi, :opened, %{device: id, direction: :virtual, name: @loop_name}}
+      when what == :virtual ->
+        {:ok, id}
+
+      {:midi, :opened, %{device: id, direction: :input, source: source}}
+      when what == {:input, id} and source > 0 ->
+        {:ok, source}
+
+      {:midi, :error, %{op: op, reason: reason}} when op in [:open_virtual, :open_input] ->
+        {:fail, "loopback through #{inspect(@loop_name)}: #{op} failed: #{inspect(reason)}"}
+    after
+      @answer_timeout ->
+        {:fail, "loopback through #{inspect(@loop_name)}: no answer to opening #{inspect(what)}"}
+    end
+  end
+
+  defp await_loop(id, at) do
+    receive do
+      {:midi, :raw, %{device: ^id} = raw} -> check_loop(at, raw)
+    after
+      @answer_timeout ->
+        {:fail, "loopback through #{inspect(@loop_name)}: nothing came back within 5 s"}
+    end
+  end
+
+  @doc false
+  # What came back of the loop's send `at` a time: its bytes, stamped with
+  # that time (to the CoreMIDI tick) and received no earlier.
+  @spec check_loop(integer(), map()) :: Mob.Plugin.SelfTest.result()
+  def check_loop(at, %{bytes: @loop_bytes, timestamp: stamp, received: received}) do
+    cond do
+      stamp < at or stamp - at > @tick_ns ->
+        {:fail, "loopback stamped #{stamp}, sent for #{at}"}
+
+      received < at ->
+        {:fail, "loopback received #{at - received} ns before its time"}
+
+      received - at > @loop_late_ns ->
+        {:fail, "loopback received #{div(received - at, 1_000_000)} ms after its time"}
+
+      true ->
+        :pass
+    end
+  end
+
+  def check_loop(_at, %{bytes: bytes}),
+    do: {:fail, "loopback delivered #{inspect(bytes)}, sent #{inspect(@loop_bytes)}"}
 end

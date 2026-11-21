@@ -68,7 +68,7 @@ packet timestamps (13-bit ms, `MobMidi.Ble`) and audio-output frame clocks
 (Magpie's AAudio mapping) are other domains; converting into `now_ns` is the
 caller's job (Magpie keeps its frame→`CLOCK_MONOTONIC` mapping).
 
-### Native C ABI (`priv/include/mob_midi.h`, Android)
+### Native C ABI (`priv/include/mob_midi.h`; Android, then iOS in 0.4)
 
 - Implemented in `priv/native/android/mob_midi_core.c`, the plugin's
   `android.jni_source`, linked into the same app library as every static NIF,
@@ -103,8 +103,35 @@ caller's job (Magpie keeps its frame→`CLOCK_MONOTONIC` mapping).
   the app's call.
 - A header-only stream parser (`mob_midi_parser.h`) with Magpie's rules
   (running status, real-time interleave, SysEx skipped) for native users.
-- iOS: the functions exist and answer `MOB_MIDI_ERR_UNSUPPORTED`; Elixir
-  refuses `deliver: :native` there.
+- iOS (0.3): the functions existed and answered `MOB_MIDI_ERR_UNSUPPORTED`;
+  Elixir refused `deliver: :native` there.
+- iOS (0.4, MOB-543): implemented in `priv/native/ios/mob_midi_nif.m` with
+  Android's structure, names and semantics, sharing the queue header. What
+  differs, and why:
+  - Each output's dispatcher is a pthread with time-constraint (real-time)
+    scheduling that hands a due batch to `MIDISend` / `MIDIReceived` stamped
+    with its time. Measured on a Mac: a default-priority waiter woke 1–9 ms
+    late (Darwin timer coalescing), a real-time one ~10 µs; CoreMIDI then
+    delivers within ~40 µs. Handing messages to CoreMIDI early with future
+    stamps would schedule just as precisely, but then `discard` can't drop
+    them: `MIDIFlushOutput` unschedules them yet delivers a `0xFF` (System
+    Reset) to a virtual destination. Holding until due keeps "bytes already
+    handed over can't be recalled" true only of due ones, as on Android.
+  - CoreMIDI never makes a sender wait for a receiver, so a queue fills only
+    with sends scheduled far ahead; the refuse-until-drained rule and
+    `:drained` stay identical.
+  - A virtual destination doesn't say who sends into it, and a virtual
+    source doesn't say who listens: no generation change per sender, no
+    `:virtual_status`, no `:no_listener`. The endpoints live until the app
+    exits (a reopen keeps other apps' connections); `close/2` ends the
+    subscription and the output handle.
+  - The client is made on a `mob_midi` thread that runs a run loop: CoreMIDI
+    calls notify procs on the run loop of the thread that made the process's
+    first client, and before this no hot-plug event ever reached iOS apps.
+    Removed devices' ports are closed there, as on Android.
+  - The iOS clock is `mach_absolute_time` in ns (`CLOCK_UPTIME_RAW`);
+    ns -> ticks rounds up, so `at:` is never early and a received stamp
+    sent on keeps its tick.
 
 ### Ownership
 
